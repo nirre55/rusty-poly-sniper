@@ -154,9 +154,6 @@ async fn main() -> Result<()> {
 
         let mut exited_sides: HashSet<String> = HashSet::new();
 
-        // Warmup : ignorer les signaux d'entrée pendant 3s (snapshot WS initiale souvent stale)
-        let warmup_until = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-
         // ── Boucle de trading sur ce marché ──────────────────────────────────
         loop {
             tokio::select! {
@@ -193,14 +190,13 @@ async fn main() -> Result<()> {
 
                     for pos in positions_snapshot {
                         let Some(tp) = prices.get(&pos.token_id) else { continue };
-                        // Utiliser best_bid pour le TP/SL (prix auquel on vendrait réellement)
-                        let sell_price = tp.best_bid;
-                        if sell_price <= 0.0 { continue; }
+                        let current_price = tp.price;
+                        if current_price <= 0.0 { continue; }
 
-                        if sell_price >= pos.tp_price {
+                        if current_price >= pos.tp_price {
                             info!(
-                                "[TP HIT] {} bid={:.2}¢ >= TP={:.2}¢ | trade_id={}",
-                                pos.token_side, sell_price * 100.0, pos.tp_price * 100.0, pos.trade_id
+                                "[TP HIT] {} price={:.2}¢ >= TP={:.2}¢ | trade_id={}",
+                                pos.token_side, current_price * 100.0, pos.tp_price * 100.0, pos.trade_id
                             );
                             match poly_client.sell_market(&pos.token_id, pos.shares).await {
                                 Ok(sell_result) => {
@@ -216,10 +212,10 @@ async fn main() -> Result<()> {
                                     exited_sides.insert(pos.token_side.clone());
                                 }
                             }
-                        } else if sell_price <= pos.sl_price {
+                        } else if current_price <= pos.sl_price {
                             info!(
-                                "[SL HIT] {} bid={:.2}¢ <= SL={:.2}¢ | trade_id={}",
-                                pos.token_side, sell_price * 100.0, pos.sl_price * 100.0, pos.trade_id
+                                "[SL HIT] {} price={:.2}¢ <= SL={:.2}¢ | trade_id={}",
+                                pos.token_side, current_price * 100.0, pos.sl_price * 100.0, pos.trade_id
                             );
                             match poly_client.sell_market(&pos.token_id, pos.shares).await {
                                 Ok(sell_result) => {
@@ -238,27 +234,18 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // ── Vérifier entrée (utiliser best_ask = prix d'achat réel) ──
+                    // ── Vérifier entrée ──
                     if position_mgr.has_position_on_slug(&slug) {
                         continue;
                     }
 
-                    // Warmup : ignorer les signaux d'entrée tant que l'orderbook n'est pas stabilisé
-                    if tokio::time::Instant::now() < warmup_until {
-                        continue;
-                    }
-
-                    // Sanity check : UP ask + DOWN ask doit être ~100¢ (marché binaire)
-                    let up_ask = prices.get(&market.up_token_id).map(|p| p.best_ask).unwrap_or(0.0);
-                    let down_ask = prices.get(&market.down_token_id).map(|p| p.best_ask).unwrap_or(0.0);
-                    if up_ask > 0.0 && down_ask > 0.0 {
-                        let sum = up_ask + down_ask;
-                        if sum > 1.15 || sum < 0.85 {
-                            debug!("[SANITY] UP ask={:.2}¢ + DOWN ask={:.2}¢ = {:.2}¢ — hors range, skip",
-                                up_ask * 100.0, down_ask * 100.0, sum * 100.0);
-                            continue;
-                        }
-                    }
+                    // Log prix courants pour debug
+                    let up_price = prices.get(&market.up_token_id).map(|p| p.price).unwrap_or(0.0);
+                    let down_price = prices.get(&market.down_token_id).map(|p| p.price).unwrap_or(0.0);
+                    debug!(
+                        "[PRICES] UP={:.2}¢ DOWN={:.2}¢",
+                        up_price * 100.0, down_price * 100.0
+                    );
 
                     for (token_id, token_side) in [
                         (&market.up_token_id, "UP"),
@@ -267,21 +254,21 @@ async fn main() -> Result<()> {
                         if exited_sides.contains(token_side) { continue; }
 
                         let Some(tp) = prices.get(token_id) else { continue };
-                        let ask_price = tp.best_ask;
-                        if ask_price <= 0.0 || ask_price >= 1.0 { continue; }
+                        let token_price = tp.price;
+                        if token_price <= 0.0 || token_price >= 1.0 { continue; }
 
-                        // Condition d'entrée basée sur le best_ask (prix réel d'achat)
-                        if ask_price <= config.entry_threshold {
+                        // Condition d'entrée : prix du token >= seuil
+                        if token_price < config.entry_threshold {
                             continue;
                         }
 
                         let trade_amount = money_manager.lock().await.current_amount();
                         info!(
-                            "[ENTRY SIGNAL] {} ask={:.2}¢ >= seuil={:.2}¢ | montant={:.2}USDC",
-                            token_side, ask_price * 100.0, config.entry_threshold * 100.0, trade_amount
+                            "[ENTRY SIGNAL] {} price={:.2}¢ >= seuil={:.2}¢ | montant={:.2}USDC",
+                            token_side, token_price * 100.0, config.entry_threshold * 100.0, trade_amount
                         );
 
-                        match poly_client.buy_market(token_id, trade_amount, ask_price).await {
+                        match poly_client.buy_market(token_id, trade_amount, token_price).await {
                             Ok(buy_result) => {
                                 let fill_price = buy_result.fill_price;
                                 let shares = buy_result.shares;
