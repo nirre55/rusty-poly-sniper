@@ -3,7 +3,7 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use rusty_poly_sniper::config::Config;
 use rusty_poly_sniper::logger::{TradeLogger, TradeRecord};
@@ -154,6 +154,9 @@ async fn main() -> Result<()> {
 
         let mut exited_sides: HashSet<String> = HashSet::new();
 
+        // Warmup : ignorer les signaux d'entrée pendant 3s (snapshot WS initiale souvent stale)
+        let warmup_until = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+
         // ── Boucle de trading sur ce marché ──────────────────────────────────
         loop {
             tokio::select! {
@@ -238,6 +241,23 @@ async fn main() -> Result<()> {
                     // ── Vérifier entrée (utiliser best_ask = prix d'achat réel) ──
                     if position_mgr.has_position_on_slug(&slug) {
                         continue;
+                    }
+
+                    // Warmup : ignorer les signaux d'entrée tant que l'orderbook n'est pas stabilisé
+                    if tokio::time::Instant::now() < warmup_until {
+                        continue;
+                    }
+
+                    // Sanity check : UP ask + DOWN ask doit être ~100¢ (marché binaire)
+                    let up_ask = prices.get(&market.up_token_id).map(|p| p.best_ask).unwrap_or(0.0);
+                    let down_ask = prices.get(&market.down_token_id).map(|p| p.best_ask).unwrap_or(0.0);
+                    if up_ask > 0.0 && down_ask > 0.0 {
+                        let sum = up_ask + down_ask;
+                        if sum > 1.15 || sum < 0.85 {
+                            debug!("[SANITY] UP ask={:.2}¢ + DOWN ask={:.2}¢ = {:.2}¢ — hors range, skip",
+                                up_ask * 100.0, down_ask * 100.0, sum * 100.0);
+                            continue;
+                        }
                     }
 
                     for (token_id, token_side) in [
