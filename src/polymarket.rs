@@ -409,9 +409,9 @@ impl PolymarketClient {
         let t0 = Instant::now();
         let client = self.get_or_create_sdk_client().await?;
 
-        // Tronquer les shares à 4 décimales
-        let truncated_shares = (shares * 10000.0).floor() / 10000.0;
-        let share_amount = Decimal::from_str(&format!("{:.4}", truncated_shares))
+        // Tronquer les shares à 2 décimales (limite SDK)
+        let truncated_shares = (shares * 100.0).floor() / 100.0;
+        let share_amount = Decimal::from_str(&format!("{:.2}", truncated_shares))
             .map_err(|e| anyhow!("Decimal shares: {}", e))?;
 
         // Prix plancher 0.01 pour SELL market (garantir le fill au meilleur bid)
@@ -509,7 +509,7 @@ impl PolymarketClient {
                 Ok(result) => return Ok(result),
                 Err(e) if Self::is_balance_error(&e) => {
                     if let Some(balance) = Self::extract_balance(&e) {
-                        let adjusted = balance / 1_000_000.0;
+                        let adjusted = (balance / 1_000_000.0 * 100.0).floor() / 100.0;
                         warn!(
                             "[SELL] Balance insuffisante — retry avec solde réel: {:.4} shares (demandé: {:.4})",
                             adjusted, current_shares
