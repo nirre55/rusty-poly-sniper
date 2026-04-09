@@ -3,7 +3,7 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use rusty_poly_sniper::config::Config;
 use rusty_poly_sniper::logger::{TradeLogger, TradeRecord};
@@ -91,6 +91,17 @@ async fn main() -> Result<()> {
     )));
 
     let mut position_mgr = PositionManager::new(&config.logs_dir);
+
+    // Ignorer le marché en cours au démarrage — attendre le prochain
+    {
+        let slug = current_market_slug(&config.polymarket_slug_prefix, interval_secs);
+        let remaining = seconds_until_market_end(interval_secs);
+        info!(
+            "[STARTUP] Marché en cours {} ignoré — attente du prochain dans {}s",
+            slug, remaining
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(remaining as u64 + 1)).await;
+    }
 
     // ── Boucle de résilience : un marché à la fois ───────────────────────────
     loop {
@@ -239,10 +250,9 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // Log prix courants pour debug
                     let up_price = prices.get(&market.up_token_id).map(|p| p.price).unwrap_or(0.0);
                     let down_price = prices.get(&market.down_token_id).map(|p| p.price).unwrap_or(0.0);
-                    debug!(
+                    info!(
                         "[PRICES] UP={:.2}¢ DOWN={:.2}¢",
                         up_price * 100.0, down_price * 100.0
                     );
