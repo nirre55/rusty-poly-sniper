@@ -252,10 +252,7 @@ async fn main() -> Result<()> {
 
                     let up_price = prices.get(&market.up_token_id).map(|p| p.price).unwrap_or(0.0);
                     let down_price = prices.get(&market.down_token_id).map(|p| p.price).unwrap_or(0.0);
-                    info!(
-                        "[PRICES] UP={:.2}¢ DOWN={:.2}¢",
-                        up_price * 100.0, down_price * 100.0
-                    );
+                    let _ = (up_price, down_price);
 
                     for (token_id, token_side) in [
                         (&market.up_token_id, "UP"),
