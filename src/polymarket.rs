@@ -221,25 +221,31 @@ impl PolymarketClient {
 
     /// Place un ordre BUY market FOK.
     /// Retourne le fill_price et les shares reçues.
+    /// Place un ordre BUY market FOK.
+    /// `current_price` est le prix courant du token (utilisé pour simuler le fill en dry-run).
     pub async fn buy_market(
         &self,
         token_id: &str,
         amount_usdc: f64,
+        current_price: f64,
     ) -> Result<OrderResult> {
         let submitted_at = Utc::now();
 
         if self.config.execution_mode == ExecutionMode::DryRun {
+            let fill = current_price;
+            let shares = if fill > 0.0 { amount_usdc / fill } else { 0.0 };
             info!(
-                "[DRY-RUN BUY] token={} amount={:.2} USDC",
+                "[DRY-RUN BUY] token={} amount={:.2} USDC fill={:.2}¢ shares={:.4}",
                 &token_id[..8],
-                amount_usdc
+                amount_usdc,
+                fill * 100.0,
+                shares
             );
-            // Simuler un fill au prix d'entrée approximatif
             return Ok(OrderResult {
                 order_id: format!("dry-{}", uuid::Uuid::new_v4()),
                 status: "Matched".to_string(),
-                fill_price: self.config.entry_threshold,
-                shares: amount_usdc / self.config.entry_threshold,
+                fill_price: fill,
+                shares,
                 submitted_at,
                 ack_at: Utc::now(),
             });

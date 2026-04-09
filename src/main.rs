@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -164,6 +165,8 @@ async fn main() -> Result<()> {
         let prefetch_timer = tokio::time::sleep(std::time::Duration::from_secs(prefetch_delay as u64));
         tokio::pin!(prefetch_timer);
         let mut prefetch_done = false;
+        // Tokens déjà tradés (TP/SL atteint) sur ce marché — pas de re-entry
+        let mut exited_sides: HashSet<String> = HashSet::new();
 
         // ── Boucle de trading sur ce marché ──────────────────────────────────
         loop {
@@ -228,6 +231,7 @@ async fn main() -> Result<()> {
                                         latency,
                                     );
                                     position_mgr.close(&pos.trade_id);
+                                    exited_sides.insert(pos.token_side.clone());
                                     money_manager.lock().await.on_outcome("WIN");
                                 }
                                 Err(e) => error!("[TP SELL] Erreur: {}", e),
@@ -252,6 +256,7 @@ async fn main() -> Result<()> {
                                         latency,
                                     );
                                     position_mgr.close(&pos.trade_id);
+                                    exited_sides.insert(pos.token_side.clone());
                                     money_manager.lock().await.on_outcome("LOSS");
                                 }
                                 Err(e) => error!("[SL SELL] Erreur: {}", e),
@@ -261,6 +266,7 @@ async fn main() -> Result<()> {
 
                     // ── Vérifier entrée ──────────────────────────────────
                     if !position_mgr.has_position_on_slug(&slug)
+                        && !exited_sides.contains(token_side)
                         && update.price >= config.entry_threshold
                     {
                         let trade_amount = money_manager.lock().await.current_amount();
@@ -272,7 +278,7 @@ async fn main() -> Result<()> {
                             trade_amount
                         );
 
-                        match poly_client.buy_market(token_id, trade_amount).await {
+                        match poly_client.buy_market(token_id, trade_amount, update.price).await {
                             Ok(buy_result) => {
                                 let fill_price = buy_result.fill_price;
                                 let shares = buy_result.shares;
