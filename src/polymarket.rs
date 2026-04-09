@@ -297,7 +297,7 @@ impl PolymarketClient {
         let client = if let Some(funder) = self.config.polymarket_funder.as_deref() {
             let funder = Address::from_str(funder)
                 .map_err(|e| anyhow!("POLYMARKET_FUNDER invalide: {}", e))?;
-            let signature_type = match self.config.polymarket_signature_type.unwrap_or(2) {
+            let signature_type = match self.config.polymarket_signature_type.unwrap_or(1) {
                 0 => SdkSignatureType::Eoa,
                 1 => SdkSignatureType::Proxy,
                 2 => SdkSignatureType::GnosisSafe,
