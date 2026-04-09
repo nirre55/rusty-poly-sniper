@@ -27,6 +27,29 @@ fn seconds_until_market_end(interval_secs: i64) -> i64 {
     candle_end_secs - now_secs
 }
 
+/// Slug du marché suivant (celui qui ouvre quand le courant expire).
+fn next_market_slug(prefix: &str, interval_secs: i64) -> String {
+    let now_secs = Utc::now().timestamp();
+    let next_open_secs = (now_secs / interval_secs) * interval_secs + interval_secs;
+    format!("{}-{}", prefix, next_open_secs)
+}
+
+/// Pré-fetch du marché suivant + warm caches SDK en arrière-plan.
+fn spawn_prefetch_next_market(
+    poly_client: &Arc<PolymarketClient>,
+    prefix: &str,
+    interval_secs: i64,
+) {
+    let poly = poly_client.clone();
+    let slug = next_market_slug(prefix, interval_secs);
+    tokio::spawn(async move {
+        if let Ok(market) = poly.resolve_market(&slug).await {
+            poly.warm_sdk_caches(&market).await;
+            info!("[PREFETCH] Marché suivant pré-chargé: {}", slug);
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -136,9 +159,19 @@ async fn main() -> Result<()> {
         let market_end = tokio::time::sleep(std::time::Duration::from_secs(remaining as u64));
         tokio::pin!(market_end);
 
+        // Timer pré-fetch du marché suivant (~30s avant expiration)
+        let prefetch_delay = if remaining > 35 { remaining - 30 } else { 0 };
+        let prefetch_timer = tokio::time::sleep(std::time::Duration::from_secs(prefetch_delay as u64));
+        tokio::pin!(prefetch_timer);
+        let mut prefetch_done = false;
+
         // ── Boucle de trading sur ce marché ──────────────────────────────────
         loop {
             tokio::select! {
+                _ = &mut prefetch_timer, if !prefetch_done => {
+                    spawn_prefetch_next_market(&poly_client, &config.polymarket_slug_prefix, interval_secs);
+                    prefetch_done = true;
+                }
                 _ = &mut market_end => {
                     info!("[MARKET] Marché {} expiré — passage au suivant", slug);
                     // Fermer les positions restantes (le marché résout automatiquement)
