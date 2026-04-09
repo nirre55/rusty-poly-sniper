@@ -499,13 +499,26 @@ impl PolymarketClient {
         submitted_at: DateTime<Utc>,
         shares: f64,
     ) -> Result<OrderResult> {
+        let mut current_shares = shares;
         let mut attempt = 0usize;
         loop {
             match self
-                .submit_sell_order(token_id, submitted_at, shares)
+                .submit_sell_order(token_id, submitted_at, current_shares)
                 .await
             {
                 Ok(result) => return Ok(result),
+                Err(e) if Self::is_balance_error(&e) => {
+                    if let Some(balance) = Self::extract_balance(&e) {
+                        let adjusted = balance / 1_000_000.0;
+                        warn!(
+                            "[SELL] Balance insuffisante — retry avec solde réel: {:.4} shares (demandé: {:.4})",
+                            adjusted, current_shares
+                        );
+                        current_shares = adjusted;
+                        continue;
+                    }
+                    return Err(e);
+                }
                 Err(e) if Self::is_fok_unfilled(&e) && attempt < FOK_RETRY_DELAYS_SECS.len() => {
                     let delay = FOK_RETRY_DELAYS_SECS[attempt];
                     warn!(
@@ -526,5 +539,19 @@ impl PolymarketClient {
         let msg = err.to_string().to_ascii_lowercase();
         msg.contains("fok orders are fully filled or killed")
             || msg.contains("order couldn't be fully filled")
+    }
+
+    fn is_balance_error(err: &anyhow::Error) -> bool {
+        err.to_string().contains("not enough balance")
+    }
+
+    /// Extrait le solde réel depuis l'erreur "balance: 1232000, order amount: 1250000"
+    fn extract_balance(err: &anyhow::Error) -> Option<f64> {
+        let msg = err.to_string();
+        let marker = "balance: ";
+        let start = msg.find(marker)? + marker.len();
+        let rest = &msg[start..];
+        let end = rest.find(|c: char| !c.is_ascii_digit())?;
+        rest[..end].parse::<f64>().ok()
     }
 }
