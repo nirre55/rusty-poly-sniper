@@ -133,12 +133,17 @@ impl PolymarketClient {
         }
     }
 
-    /// Keep-alive ping toutes les 20s.
+    /// Keep-alive ping toutes les 20s (notre client HTTP + le client interne SDK).
     pub async fn run_keep_alive_loop(&self) {
         let mut ticker = tokio::time::interval(Duration::from_secs(20));
         loop {
             ticker.tick().await;
+            // Keep-alive sur notre client HTTP
             let _ = self.http.get(format!("{}/ok", CLOB_API_BASE)).send().await;
+            // Keep-alive sur le client HTTP interne du SDK (même connection pool)
+            if let Ok(client) = self.get_or_create_sdk_client().await {
+                let _ = client.server_time().await;
+            }
         }
     }
 
