@@ -92,10 +92,29 @@ async fn main() -> Result<()> {
 
     let mut position_mgr = PositionManager::new(&config.logs_dir);
 
-    // Ignorer le marché en cours au démarrage — attendre le prochain
+    // ── Test latence GTC limit vs FOK ─────────────────────────────────────
     {
         let slug = current_market_slug(&config.polymarket_slug_prefix, interval_secs);
         let remaining = seconds_until_market_end(interval_secs);
+        info!("[LATENCY TEST] Test de placement d'ordre GTC limit sur {}", slug);
+
+        match poly_client.resolve_market(&slug).await {
+            Ok(market) => {
+                poly_client.warm_sdk_caches(&market).await;
+                // Place un limit buy à un prix très bas (0.05) pour ne pas être fill
+                let test_price = 0.05;
+                let test_amount = 1.0;
+                match poly_client.place_limit_buy(&market.up_token_id, test_amount, test_price).await {
+                    Ok(result) => {
+                        // Annuler immédiatement
+                        let _ = poly_client.cancel_order(&result.order_id).await;
+                    }
+                    Err(e) => warn!("[LATENCY TEST] Erreur placement limit: {}", e),
+                }
+            }
+            Err(e) => warn!("[LATENCY TEST] Impossible de résoudre le marché: {}", e),
+        }
+
         info!(
             "[STARTUP] Marché en cours {} ignoré — attente du prochain dans {}s",
             slug, remaining
