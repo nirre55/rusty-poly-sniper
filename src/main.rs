@@ -164,8 +164,8 @@ async fn main() -> Result<()> {
         let mut prefetch_done = false;
 
         match config.execution_mode {
-            ExecutionMode::Limit => {
-                run_limit_loop(
+            ExecutionMode::NoTpNoSl => {
+                run_no_tp_no_sl_loop(
                     &config,
                     &poly_client,
                     &trade_logger,
@@ -203,10 +203,10 @@ async fn main() -> Result<()> {
         }
 
         ws_handle.abort();
-        // En mode limit, annuler les ordres restants en fin de marché
-        if config.execution_mode == ExecutionMode::Limit {
+        // En mode no-tp-no-sl, annuler les ordres restants en fin de marché
+        if config.execution_mode == ExecutionMode::NoTpNoSl {
             if let Err(e) = poly_client.cancel_all_orders().await {
-                warn!("[LIMIT] Erreur annulation ordres fin de marché: {}", e);
+                warn!("[NO-TP-NO-SL] Erreur annulation ordres fin de marché: {}", e);
             }
         }
         info!("[MARKET] Attente du prochain marché...");
@@ -396,7 +396,7 @@ async fn run_market_loop(
 // Pas de TP, pas de SL — juste entry.
 
 #[allow(clippy::too_many_arguments)]
-async fn run_limit_loop(
+async fn run_no_tp_no_sl_loop(
     config: &Config,
     poly_client: &Arc<PolymarketClient>,
     trade_logger: &Arc<TradeLogger>,
