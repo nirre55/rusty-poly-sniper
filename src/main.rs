@@ -391,9 +391,9 @@ async fn run_market_loop(
 // ── Mode LIMIT ──────────────────────────────────────────────────────────────
 //
 // Surveille l'entry sur les 2 côtés indépendamment (1 position max par côté).
-// Quand UP atteint le seuil → FOK BUY UP + GTC SELL TP.
-// Quand DOWN atteint le seuil → FOK BUY DOWN + GTC SELL TP.
-// Pas de SL réactif, pas de monitoring TP — le GTC sell gère tout.
+// Quand UP atteint le seuil → FOK BUY UP.
+// Quand DOWN atteint le seuil → FOK BUY DOWN.
+// Pas de TP, pas de SL — juste entry.
 
 #[allow(clippy::too_many_arguments)]
 async fn run_limit_loop(
@@ -465,13 +465,12 @@ async fn run_limit_loop(
                         Ok(buy_result) => {
                             let fill_price = buy_result.fill_price;
                             let shares = buy_result.shares;
-                            let tp_price = calculate_tp(fill_price, config.tp_offset_cents).min(0.99);
                             let trade_id = uuid::Uuid::new_v4().to_string();
                             let latency = (buy_result.ack_at - buy_result.submitted_at).num_milliseconds();
 
                             info!(
-                                "[ENTRY FILLED] {} | fill={:.2}¢ shares={:.4} TP={:.2}¢ | {}ms",
-                                token_side, fill_price * 100.0, shares, tp_price * 100.0, latency
+                                "[ENTRY FILLED] {} | fill={:.2}¢ shares={:.4} | {}ms",
+                                token_side, fill_price * 100.0, shares, latency
                             );
 
                             let _ = trade_logger.log_trade(&TradeRecord {
@@ -482,7 +481,7 @@ async fn run_limit_loop(
                                 amount_usdc: format!("{:.2}", trade_amount),
                                 shares: format!("{:.6}", shares),
                                 fill_price: format!("{:.4}", fill_price),
-                                tp_price: format!("{:.2}", tp_price),
+                                tp_price: String::new(),
                                 sl_price: String::new(),
                                 exit_price: String::new(),
                                 exit_reason: String::new(),
@@ -497,30 +496,12 @@ async fn run_limit_loop(
                                 token_side: token_side.to_string(),
                                 fill_price,
                                 shares,
-                                tp_price,
+                                tp_price: 0.0,
                                 sl_price: 0.0,
                                 entry_time_utc: Utc::now().to_rfc3339(),
                             });
 
                             has_position.insert(token_side.to_string());
-
-                            // ── Placer le GTC limit SELL au TP ──────────
-                            match poly_client
-                                .place_limit_sell(token_id, shares, tp_price)
-                                .await
-                            {
-                                Ok(tp_result) => {
-                                    info!(
-                                        "[LIMIT] GTC SELL TP {} placé @ {:.2}¢ | order_id={}",
-                                        token_side,
-                                        tp_price * 100.0,
-                                        &tp_result.order_id
-                                    );
-                                }
-                                Err(e) => {
-                                    error!("[LIMIT] Erreur placement GTC SELL TP {}: {}", token_side, e);
-                                }
-                            }
                         }
                         Err(e) => error!("[ENTRY BUY] {} Erreur: {}", token_side, e),
                     }
