@@ -388,18 +388,12 @@ async fn run_market_loop(
     }
 }
 
-// ── Mode LIMIT (entry FOK + TP via GTC limit SELL pré-placé) ────────────────
+// ── Mode LIMIT ──────────────────────────────────────────────────────────────
 //
-// L'entry reste en FOK réactif (on ne peut pas pré-placer un limit buy pour
-// capturer une montée de prix — il se ferait fill immédiatement au prix actuel).
-// Le TP est pré-placé en GTC limit SELL juste après le fill entry → 0ms de latence.
-// Le SL reste en FOK réactif.
-
-/// État de l'ordre GTC limit TP posé après un fill entry.
-struct LimitTp {
-    order_id: String,
-    tp_price: f64,
-}
+// Surveille l'entry sur les 2 côtés indépendamment (1 position max par côté).
+// Quand UP atteint le seuil → FOK BUY UP + GTC SELL TP.
+// Quand DOWN atteint le seuil → FOK BUY DOWN + GTC SELL TP.
+// Pas de SL réactif, pas de monitoring TP — le GTC sell gère tout.
 
 #[allow(clippy::too_many_arguments)]
 async fn run_limit_loop(
@@ -417,8 +411,8 @@ async fn run_limit_loop(
     prefetch_done: &mut bool,
     interval_secs: i64,
 ) {
-    let mut exited_sides: HashSet<String> = HashSet::new();
-    let mut tp_order: Option<LimitTp> = None;
+    // Track quels côtés ont déjà une position ouverte (1 max par côté)
+    let mut has_position: HashSet<String> = HashSet::new();
 
     loop {
         tokio::select! {
@@ -445,77 +439,13 @@ async fn run_limit_loop(
                     Err(_) => continue,
                 };
 
-                // ── Surveiller TP (via GTC) et SL (réactif FOK) ─────────
-                let positions_snapshot: Vec<OpenPosition> = position_mgr
-                    .positions_for_slug(slug)
-                    .into_iter()
-                    .cloned()
-                    .collect();
-
-                for pos in positions_snapshot {
-                    let Some(tp) = prices.get(&pos.token_id) else { continue };
-                    let current_price = tp.price;
-                    if current_price <= 0.0 { continue; }
-
-                    // TP : notre GTC sell limit a été fill par le matching engine
-                    if tp_order.is_some() && current_price >= pos.tp_price {
-                        let tp_info = tp_order.take().unwrap();
-                        info!(
-                            "[LIMIT TP FILLED] {} price={:.2}¢ >= TP={:.2}¢ | trade_id={}",
-                            pos.token_side,
-                            current_price * 100.0,
-                            pos.tp_price * 100.0,
-                            pos.trade_id
-                        );
-                        log_exit(trade_logger, &pos, "TP", tp_info.tp_price, 0);
-                        position_mgr.close(&pos.trade_id);
-                        exited_sides.insert(pos.token_side.clone());
-                        money_manager.lock().await.on_outcome("WIN");
-                    }
-                    // SL : réactif, FOK sell
-                    else if current_price <= pos.sl_price {
-                        info!(
-                            "[SL HIT] {} price={:.2}¢ <= SL={:.2}¢ | trade_id={}",
-                            pos.token_side,
-                            current_price * 100.0,
-                            pos.sl_price * 100.0,
-                            pos.trade_id
-                        );
-
-                        // Annuler l'ordre TP GTC s'il existe
-                        if let Some(tp_info) = tp_order.take() {
-                            if let Err(e) = poly_client.cancel_order(&tp_info.order_id).await {
-                                warn!("[LIMIT] Erreur annulation TP order: {}", e);
-                            }
-                        }
-
-                        match poly_client.sell_market(&pos.token_id, pos.shares).await {
-                            Ok(sell_result) => {
-                                let latency = (sell_result.ack_at - sell_result.submitted_at).num_milliseconds();
-                                log_exit(trade_logger, &pos, "SL", sell_result.fill_price, latency);
-                                position_mgr.close(&pos.trade_id);
-                                exited_sides.insert(pos.token_side.clone());
-                                money_manager.lock().await.on_outcome("LOSS");
-                            }
-                            Err(e) => {
-                                error!("[SL SELL FAILED] {} — position fermée avec erreur", e);
-                                position_mgr.close(&pos.trade_id);
-                                exited_sides.insert(pos.token_side.clone());
-                            }
-                        }
-                    }
-                }
-
-                // ── Vérifier entrée (FOK, comme mode market) ────────────
-                if position_mgr.has_position_on_slug(slug) {
-                    continue;
-                }
-
+                // ── Vérifier entry sur chaque côté indépendamment ───────
                 for (token_id, token_side) in [
                     (&market.up_token_id, "UP"),
                     (&market.down_token_id, "DOWN"),
                 ] {
-                    if exited_sides.contains(token_side) { continue; }
+                    // 1 position max par côté
+                    if has_position.contains(token_side) { continue; }
 
                     let Some(tp) = prices.get(token_id) else { continue };
                     let token_price = tp.price;
@@ -536,13 +466,12 @@ async fn run_limit_loop(
                             let fill_price = buy_result.fill_price;
                             let shares = buy_result.shares;
                             let tp_price = calculate_tp(fill_price, config.tp_offset_cents).min(0.99);
-                            let sl_price = calculate_sl(fill_price, config.sl_offset_cents).max(0.01);
                             let trade_id = uuid::Uuid::new_v4().to_string();
                             let latency = (buy_result.ack_at - buy_result.submitted_at).num_milliseconds();
 
                             info!(
-                                "[ENTRY FILLED] {} | fill={:.2}¢ shares={:.4} TP={:.2}¢ SL={:.2}¢ | {}ms",
-                                token_side, fill_price * 100.0, shares, tp_price * 100.0, sl_price * 100.0, latency
+                                "[ENTRY FILLED] {} | fill={:.2}¢ shares={:.4} TP={:.2}¢ | {}ms",
+                                token_side, fill_price * 100.0, shares, tp_price * 100.0, latency
                             );
 
                             let _ = trade_logger.log_trade(&TradeRecord {
@@ -554,7 +483,7 @@ async fn run_limit_loop(
                                 shares: format!("{:.6}", shares),
                                 fill_price: format!("{:.4}", fill_price),
                                 tp_price: format!("{:.2}", tp_price),
-                                sl_price: format!("{:.2}", sl_price),
+                                sl_price: String::new(),
                                 exit_price: String::new(),
                                 exit_reason: String::new(),
                                 latency_ms: format!("{}", latency),
@@ -569,9 +498,11 @@ async fn run_limit_loop(
                                 fill_price,
                                 shares,
                                 tp_price,
-                                sl_price,
+                                sl_price: 0.0,
                                 entry_time_utc: Utc::now().to_rfc3339(),
                             });
+
+                            has_position.insert(token_side.to_string());
 
                             // ── Placer le GTC limit SELL au TP ──────────
                             match poly_client
@@ -580,24 +511,19 @@ async fn run_limit_loop(
                             {
                                 Ok(tp_result) => {
                                     info!(
-                                        "[LIMIT] GTC SELL TP placé @ {:.2}¢ | order_id={}",
+                                        "[LIMIT] GTC SELL TP {} placé @ {:.2}¢ | order_id={}",
+                                        token_side,
                                         tp_price * 100.0,
                                         &tp_result.order_id
                                     );
-                                    tp_order = Some(LimitTp {
-                                        order_id: tp_result.order_id,
-                                        tp_price,
-                                    });
                                 }
                                 Err(e) => {
-                                    warn!("[LIMIT] Erreur placement GTC SELL TP: {} — fallback sur TP réactif", e);
-                                    // Pas de tp_order → le TP sera géré en FOK comme le mode market
+                                    error!("[LIMIT] Erreur placement GTC SELL TP {}: {}", token_side, e);
                                 }
                             }
                         }
-                        Err(e) => error!("[ENTRY BUY] Erreur: {}", e),
+                        Err(e) => error!("[ENTRY BUY] {} Erreur: {}", token_side, e),
                     }
-                    break;
                 }
             }
         }
