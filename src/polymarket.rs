@@ -567,10 +567,12 @@ impl PolymarketClient {
         let client = self.get_or_create_sdk_client().await?;
         let t_client = t0.elapsed().as_millis();
 
-        let truncated = (amount_usdc * 100.0).floor() / 100.0;
+        let raw_shares = (amount_usdc / limit_price * 100.0).floor() / 100.0;
+        // Minimum 5 shares pour les ordres limit sur Polymarket
+        let final_shares = raw_shares.max(5.0);
         let price = Decimal::from_str(&format!("{:.2}", limit_price))
             .map_err(|e| anyhow!("Decimal: {}", e))?;
-        let shares = Decimal::from_str(&format!("{:.2}", (truncated / limit_price * 100.0).floor() / 100.0))
+        let shares = Decimal::from_str(&format!("{:.2}", final_shares))
             .map_err(|e| anyhow!("Decimal: {}", e))?;
 
         let order = client
