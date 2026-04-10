@@ -203,12 +203,6 @@ async fn main() -> Result<()> {
         }
 
         ws_handle.abort();
-        // En mode no-tp-no-sl, annuler les ordres restants en fin de marché
-        if config.execution_mode == ExecutionMode::NoTpNoSl {
-            if let Err(e) = poly_client.cancel_all_orders().await {
-                warn!("[NO-TP-NO-SL] Erreur annulation ordres fin de marché: {}", e);
-            }
-        }
         info!("[MARKET] Attente du prochain marché...");
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
