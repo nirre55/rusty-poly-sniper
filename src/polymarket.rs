@@ -618,6 +618,75 @@ impl PolymarketClient {
         })
     }
 
+    /// Place un ordre GTC limit SELL.
+    pub async fn place_limit_sell(
+        &self,
+        token_id: &str,
+        shares: f64,
+        limit_price: f64,
+    ) -> Result<OrderResult> {
+        use std::time::Instant;
+
+        let sdk_signer = self
+            .sdk_signer
+            .as_ref()
+            .ok_or_else(|| anyhow!("POLYMARKET_PRIVATE_KEY requis"))?;
+
+        let t0 = Instant::now();
+        let client = self.get_or_create_sdk_client().await?;
+        let t_client = t0.elapsed().as_millis();
+
+        let truncated_shares = (shares * 100.0).floor() / 100.0;
+        let size = Decimal::from_str(&format!("{:.2}", truncated_shares))
+            .map_err(|e| anyhow!("Decimal: {}", e))?;
+        let price = Decimal::from_str(&format!("{:.2}", limit_price))
+            .map_err(|e| anyhow!("Decimal: {}", e))?;
+
+        let order = client
+            .limit_order()
+            .token_id(token_id)
+            .price(price)
+            .size(size)
+            .side(SdkSide::Sell)
+            .order_type(SdkOrderType::GTC)
+            .build()
+            .await
+            .map_err(|e| anyhow!("SDK build limit sell: {}", e))?;
+        let t_build = t0.elapsed().as_millis();
+
+        let signed = client
+            .sign(sdk_signer, order)
+            .await
+            .map_err(|e| anyhow!("SDK sign limit sell: {}", e))?;
+        let t_sign = t0.elapsed().as_millis();
+
+        let resp = client
+            .post_order(signed)
+            .await
+            .map_err(|e| anyhow!("SDK post_order limit sell: {}", e))?;
+
+        let ack_at = Utc::now();
+        let total_ms = t0.elapsed().as_millis();
+
+        let order_id = format!("{:?}", resp.order_id).trim_matches('"').to_string();
+
+        info!(
+            "[LIMIT SELL PLACED] token={} price={:.2}¢ shares={:.4} | {}ms (client={}ms build={}ms sign={}ms post={}ms) | order_id={}",
+            &token_id[..8], limit_price * 100.0, shares, total_ms,
+            t_client, t_build - t_client, t_sign - t_build, total_ms - t_sign,
+            &order_id
+        );
+
+        Ok(OrderResult {
+            order_id,
+            status: format!("{:?}", resp.status).trim_matches('"').to_string(),
+            fill_price: limit_price,
+            shares: truncated_shares,
+            submitted_at: Utc::now(),
+            ack_at,
+        })
+    }
+
     /// Annule un ordre par son ID.
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
         use std::time::Instant;
@@ -631,6 +700,22 @@ impl PolymarketClient {
         let total_ms = t0.elapsed().as_millis();
 
         info!("[ORDER CANCELLED] order_id={} | {}ms", order_id, total_ms);
+        Ok(())
+    }
+
+    /// Annule tous les ordres ouverts.
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        use std::time::Instant;
+
+        let t0 = Instant::now();
+        let client = self.get_or_create_sdk_client().await?;
+        client
+            .cancel_all_orders()
+            .await
+            .map_err(|e| anyhow!("SDK cancel_all_orders: {}", e))?;
+        let total_ms = t0.elapsed().as_millis();
+
+        info!("[ALL ORDERS CANCELLED] | {}ms", total_ms);
         Ok(())
     }
 

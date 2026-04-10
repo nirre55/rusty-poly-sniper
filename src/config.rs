@@ -6,6 +6,7 @@ use tracing::warn;
 pub enum ExecutionMode {
     DryRun,
     Market,
+    Limit,
 }
 
 impl ExecutionMode {
@@ -13,6 +14,7 @@ impl ExecutionMode {
         match self {
             ExecutionMode::DryRun => "DRY_RUN",
             ExecutionMode::Market => "MARKET",
+            ExecutionMode::Limit => "LIMIT",
         }
     }
 }
@@ -70,6 +72,7 @@ impl Config {
         let mode = env::var("EXECUTION_MODE").unwrap_or_else(|_| "dry-run".to_string());
         let execution_mode = match mode.as_str() {
             "market" => ExecutionMode::Market,
+            "limit" => ExecutionMode::Limit,
             "dry-run" | "dryrun" => ExecutionMode::DryRun,
             _ => {
                 warn!("EXECUTION_MODE '{}' non reconnu — dry-run par défaut", mode);
