@@ -342,6 +342,7 @@ impl PolymarketClient {
 
         let t0 = Instant::now();
         let client = self.get_or_create_sdk_client().await?;
+        let t_client = t0.elapsed().as_millis();
 
         let truncated = (amount_usdc * 100.0).floor() / 100.0;
         let amount = Decimal::from_str(&format!("{:.2}", truncated))
@@ -359,11 +360,13 @@ impl PolymarketClient {
             .build()
             .await
             .map_err(|e| anyhow!("SDK build: {}", e))?;
+        let t_build = t0.elapsed().as_millis();
 
         let signed = client
             .sign(sdk_signer, order)
             .await
             .map_err(|e| anyhow!("SDK sign: {}", e))?;
+        let t_sign = t0.elapsed().as_millis();
 
         let resp = client
             .post_order(signed)
@@ -379,8 +382,9 @@ impl PolymarketClient {
         let fill_price = if taking > 0.0 { making / taking } else { 0.0 };
 
         info!(
-            "[BUY] token={} amount={:.2}USDC | fill={:.4} shares={:.4} | {}ms",
-            &token_id[..8], amount_usdc, fill_price, taking, total_ms
+            "[BUY] token={} amount={:.2}USDC | fill={:.4} shares={:.4} | {}ms (client={}ms build={}ms sign={}ms post={}ms)",
+            &token_id[..8], amount_usdc, fill_price, taking, total_ms,
+            t_client, t_build - t_client, t_sign - t_build, total_ms - t_sign
         );
 
         Ok(OrderResult {
@@ -408,6 +412,7 @@ impl PolymarketClient {
 
         let t0 = Instant::now();
         let client = self.get_or_create_sdk_client().await?;
+        let t_client = t0.elapsed().as_millis();
 
         // Tronquer les shares à 2 décimales (limite SDK)
         let truncated_shares = (shares * 100.0).floor() / 100.0;
@@ -430,11 +435,13 @@ impl PolymarketClient {
             .build()
             .await
             .map_err(|e| anyhow!("SDK build sell: {}", e))?;
+        let t_build = t0.elapsed().as_millis();
 
         let signed = client
             .sign(sdk_signer, order)
             .await
             .map_err(|e| anyhow!("SDK sign sell: {}", e))?;
+        let t_sign = t0.elapsed().as_millis();
 
         let resp = client
             .post_order(signed)
@@ -450,8 +457,9 @@ impl PolymarketClient {
         let fill_price = if making > 0.0 { taking / making } else { 0.0 };
 
         info!(
-            "[SELL] token={} shares={:.4} | fill={:.4} usdc_received={:.4} | {}ms",
-            &token_id[..8], shares, fill_price, taking, total_ms
+            "[SELL] token={} shares={:.4} | fill={:.4} usdc_received={:.4} | {}ms (client={}ms build={}ms sign={}ms post={}ms)",
+            &token_id[..8], shares, fill_price, taking, total_ms,
+            t_client, t_build - t_client, t_sign - t_build, total_ms - t_sign
         );
 
         Ok(OrderResult {
