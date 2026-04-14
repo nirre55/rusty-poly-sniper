@@ -38,10 +38,24 @@ pub struct Config {
     pub polymarket_funder: Option<String>,
     /// Signature type: 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE.
     pub polymarket_signature_type: Option<u8>,
-    /// Multiplicateur Martingale. 1.0 = désactivé.
+    /// Multiplicateur Martingale (sur LOSS). 1.0 = désactivé.
     pub martingale_multiplier: f64,
-    /// Montant max Martingale en USDC. 0.0 = pas de plafond.
+    /// Multiplicateur Anti-Martingale (sur WIN). 1.0 = désactivé.
+    pub anti_martingale_multiplier: f64,
+    /// Montant max Martingale/Anti-Martingale en USDC. 0.0 = pas de plafond.
     pub martingale_max_amount: f64,
+    /// Nombre max de wins consécutifs avant reset (Anti-Martingale). 0 = pas de limite.
+    pub anti_martingale_max_streak: u32,
+    /// Multiplicateur intra-marché ping-pong. 1.0 = désactivé (1 position max par côté).
+    pub inmarket_multiplier: f64,
+    /// Nombre max d'entrées ping-pong par marché. 0 = illimité.
+    pub inmarket_max_entries: u32,
+    /// Nombre max de trades par marché en mode market. 0 = illimité.
+    pub market_max_trades: u32,
+    /// Seuil reversal : si le dernier côté entré redescend à ce prix, on ouvre sur l'opposé. 0.0 = désactivé.
+    pub reversal_threshold: f64,
+    /// Montant du trade reversal en USDC.
+    pub reversal_amount: f64,
     pub logs_dir: String,
 }
 
@@ -59,7 +73,14 @@ impl std::fmt::Debug for Config {
             .field("polymarket_funder", &self.polymarket_funder)
             .field("polymarket_signature_type", &self.polymarket_signature_type)
             .field("martingale_multiplier", &self.martingale_multiplier)
+            .field("anti_martingale_multiplier", &self.anti_martingale_multiplier)
             .field("martingale_max_amount", &self.martingale_max_amount)
+            .field("anti_martingale_max_streak", &self.anti_martingale_max_streak)
+            .field("inmarket_multiplier", &self.inmarket_multiplier)
+            .field("inmarket_max_entries", &self.inmarket_max_entries)
+            .field("market_max_trades", &self.market_max_trades)
+            .field("reversal_threshold", &self.reversal_threshold)
+            .field("reversal_amount", &self.reversal_amount)
             .field("logs_dir", &self.logs_dir)
             .finish()
     }
@@ -120,7 +141,50 @@ impl Config {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(1.0);
 
+        let anti_martingale_multiplier = env::var("ANTI_MARTINGALE_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0);
+
+        // On ne peut pas activer les deux en même temps
+        if martingale_multiplier > 1.0 && anti_martingale_multiplier > 1.0 {
+            anyhow::bail!(
+                "MARTINGALE_MULTIPLIER={} et ANTI_MARTINGALE_MULTIPLIER={} ne peuvent pas être actifs en même temps",
+                martingale_multiplier, anti_martingale_multiplier
+            );
+        }
+
         let martingale_max_amount = env::var("MARTINGALE_MAX_AMOUNT")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let anti_martingale_max_streak = env::var("ANTI_MARTINGALE_MAX_STREAK")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4);
+
+        let inmarket_multiplier = env::var("INMARKET_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(1.0);
+
+        let inmarket_max_entries = env::var("INMARKET_MAX_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        let market_max_trades = env::var("MARKET_MAX_TRADES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        let reversal_threshold = env::var("REVERSAL_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        let reversal_amount = env::var("REVERSAL_AMOUNT")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
@@ -138,7 +202,14 @@ impl Config {
             polymarket_funder: env::var("POLYMARKET_FUNDER").ok(),
             polymarket_signature_type,
             martingale_multiplier,
+            anti_martingale_multiplier,
             martingale_max_amount,
+            anti_martingale_max_streak,
+            inmarket_multiplier,
+            inmarket_max_entries,
+            market_max_trades,
+            reversal_threshold,
+            reversal_amount,
             logs_dir: env::var("LOGS_DIR").unwrap_or_else(|_| "logs".to_string()),
         })
     }

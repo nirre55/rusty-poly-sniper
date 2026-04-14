@@ -86,7 +86,9 @@ async fn main() -> Result<()> {
     let money_manager = Arc::new(tokio::sync::Mutex::new(MoneyManager::new(
         config.trade_amount_usdc,
         config.martingale_multiplier,
+        config.anti_martingale_multiplier,
         config.martingale_max_amount,
+        config.anti_martingale_max_streak,
         &config.logs_dir,
     )));
 
@@ -226,7 +228,7 @@ async fn run_market_loop(
     prefetch_done: &mut bool,
     interval_secs: i64,
 ) {
-    let mut exited_sides: HashSet<String> = HashSet::new();
+    let mut trade_count: u32 = 0;
 
     loop {
         tokio::select! {
@@ -275,13 +277,13 @@ async fn run_market_loop(
                                 let latency = (sell_result.ack_at - sell_result.submitted_at).num_milliseconds();
                                 log_exit(trade_logger, &pos, "TP", sell_result.fill_price, latency);
                                 position_mgr.close(&pos.trade_id);
-                                exited_sides.insert(pos.token_side.clone());
+
                                 money_manager.lock().await.on_outcome("WIN");
                             }
                             Err(e) => {
                                 error!("[TP SELL FAILED] {} — position fermée avec erreur", e);
                                 position_mgr.close(&pos.trade_id);
-                                exited_sides.insert(pos.token_side.clone());
+
                             }
                         }
                     } else if current_price <= pos.sl_price {
@@ -294,13 +296,13 @@ async fn run_market_loop(
                                 let latency = (sell_result.ack_at - sell_result.submitted_at).num_milliseconds();
                                 log_exit(trade_logger, &pos, "SL", sell_result.fill_price, latency);
                                 position_mgr.close(&pos.trade_id);
-                                exited_sides.insert(pos.token_side.clone());
+
                                 money_manager.lock().await.on_outcome("LOSS");
                             }
                             Err(e) => {
                                 error!("[SL SELL FAILED] {} — position fermée avec erreur", e);
                                 position_mgr.close(&pos.trade_id);
-                                exited_sides.insert(pos.token_side.clone());
+
                             }
                         }
                     }
@@ -311,12 +313,14 @@ async fn run_market_loop(
                     continue;
                 }
 
+                if config.market_max_trades > 0 && trade_count >= config.market_max_trades {
+                    continue;
+                }
+
                 for (token_id, token_side) in [
                     (&market.up_token_id, "UP"),
                     (&market.down_token_id, "DOWN"),
                 ] {
-                    if exited_sides.contains(token_side) { continue; }
-
                     let Some(tp) = prices.get(token_id) else { continue };
                     let token_price = tp.price;
                     if token_price <= 0.0 || token_price >= 1.0 { continue; }
@@ -372,6 +376,7 @@ async fn run_market_loop(
                                 sl_price,
                                 entry_time_utc: Utc::now().to_rfc3339(),
                             });
+                            trade_count += 1;
                         }
                         Err(e) => error!("[ENTRY BUY] Erreur: {}", e),
                     }
@@ -405,8 +410,16 @@ async fn run_no_tp_no_sl_loop(
     prefetch_done: &mut bool,
     interval_secs: i64,
 ) {
-    // Track quels côtés ont déjà une position ouverte (1 max par côté)
-    let mut has_position: HashSet<String> = HashSet::new();
+    // Côtés touchés (pour martingale win/loss)
+    let mut sides_touched: HashSet<String> = HashSet::new();
+    // Ping-pong: dernier côté entré + compteur d'entrées
+    let mut last_side: Option<String> = None;
+    let mut entry_count: u32 = 0;
+    // Montant de base pour ce marché (martingale/anti-martingale)
+    let base_market_amount = money_manager.lock().await.current_amount();
+    let inmarket_mult = config.inmarket_multiplier;
+    // Reversal: true quand le ping-pong est terminé et on surveille le dernier côté
+    let mut reversal_done = false;
 
     loop {
         tokio::select! {
@@ -416,9 +429,18 @@ async fn run_no_tp_no_sl_loop(
             }
             _ = &mut *market_end => {
                 info!("[MARKET] Marché {} expiré — passage au suivant", slug);
+                let num_sides = sides_touched.len();
                 let leftover = position_mgr.clear_slug(slug);
                 for pos in &leftover {
-                    warn!("[POSITION] {} non fermée avant expiration", pos.trade_id);
+                    info!("[POSITION] {} fermée par expiration marché", pos.trade_id);
+                }
+                // Martingale: 2 côtés touchés = LOSS, 1 côté = WIN, 0 = pas de trade
+                if num_sides == 2 {
+                    info!("[MARTINGALE] 2 côtés touchés (UP+DOWN) = LOSS");
+                    money_manager.lock().await.on_outcome("LOSS");
+                } else if num_sides == 1 {
+                    info!("[MARTINGALE] 1 côté touché = WIN");
+                    money_manager.lock().await.on_outcome("WIN");
                 }
                 break;
             }
@@ -433,13 +455,24 @@ async fn run_no_tp_no_sl_loop(
                     Err(_) => continue,
                 };
 
-                // ── Vérifier entry sur chaque côté indépendamment ───────
+                // ── Vérifier entry sur chaque côté ───────
                 for (token_id, token_side) in [
                     (&market.up_token_id, "UP"),
                     (&market.down_token_id, "DOWN"),
                 ] {
-                    // 1 position max par côté
-                    if has_position.contains(token_side) { continue; }
+                    // Ping-pong désactivé (inmarket_mult == 1.0) : 1 position max par côté
+                    if inmarket_mult <= 1.0 {
+                        if sides_touched.contains(token_side) { continue; }
+                    } else {
+                        // Limite d'entrées atteinte
+                        if config.inmarket_max_entries > 0 && entry_count >= config.inmarket_max_entries {
+                            continue;
+                        }
+                        // Ping-pong activé : après la 1ère entry, surveiller seulement l'autre côté
+                        if let Some(ref ls) = last_side {
+                            if ls == token_side { continue; }
+                        }
+                    }
 
                     let Some(tp) = prices.get(token_id) else { continue };
                     let token_price = tp.price;
@@ -449,10 +482,16 @@ async fn run_no_tp_no_sl_loop(
                         continue;
                     }
 
-                    let trade_amount = money_manager.lock().await.current_amount();
+                    // Calcul du montant : base_market_amount × inmarket_mult^(entrées après la 1ère)
+                    let trade_amount = if entry_count == 0 || inmarket_mult <= 1.0 {
+                        base_market_amount
+                    } else {
+                        base_market_amount * inmarket_mult.powi(entry_count as i32)
+                    };
+
                     info!(
-                        "[ENTRY SIGNAL] {} price={:.2}¢ >= seuil={:.2}¢ | montant={:.2}USDC",
-                        token_side, token_price * 100.0, config.entry_threshold * 100.0, trade_amount
+                        "[ENTRY SIGNAL] {} price={:.2}¢ >= seuil={:.2}¢ | montant={:.2}USDC (entry #{})",
+                        token_side, token_price * 100.0, config.entry_threshold * 100.0, trade_amount, entry_count + 1
                     );
 
                     match poly_client.buy_market(token_id, trade_amount, token_price).await {
@@ -463,8 +502,8 @@ async fn run_no_tp_no_sl_loop(
                             let latency = (buy_result.ack_at - buy_result.submitted_at).num_milliseconds();
 
                             info!(
-                                "[ENTRY FILLED] {} | fill={:.2}¢ shares={:.4} | {}ms",
-                                token_side, fill_price * 100.0, shares, latency
+                                "[ENTRY FILLED] {} | fill={:.2}¢ shares={:.4} | {}ms (entry #{})",
+                                token_side, fill_price * 100.0, shares, latency, entry_count + 1
                             );
 
                             let _ = trade_logger.log_trade(&TradeRecord {
@@ -495,9 +534,98 @@ async fn run_no_tp_no_sl_loop(
                                 entry_time_utc: Utc::now().to_rfc3339(),
                             });
 
-                            has_position.insert(token_side.to_string());
+                            sides_touched.insert(token_side.to_string());
+                            last_side = Some(token_side.to_string());
+                            entry_count += 1;
                         }
                         Err(e) => error!("[ENTRY BUY] {} Erreur: {}", token_side, e),
+                    }
+                }
+
+                // ── Reversal : surveiller le dernier côté entré ───────
+                if !reversal_done
+                    && config.reversal_threshold > 0.0
+                    && config.reversal_amount > 0.0
+                    && entry_count >= 2
+                {
+                    // Le ping-pong doit être terminé (limite atteinte ou désactivé après 2+)
+                    let ping_pong_done = if inmarket_mult <= 1.0 {
+                        true
+                    } else {
+                        config.inmarket_max_entries > 0 && entry_count >= config.inmarket_max_entries
+                    };
+
+                    if ping_pong_done {
+                        if let Some(ref ls) = last_side {
+                            // Token du dernier côté entré
+                            let (watch_token_id, watch_side) = if ls == "UP" {
+                                (&market.up_token_id, "UP")
+                            } else {
+                                (&market.down_token_id, "DOWN")
+                            };
+                            // Côté opposé pour le trade reversal
+                            let (reversal_token_id, reversal_side) = if ls == "UP" {
+                                (&market.down_token_id, "DOWN")
+                            } else {
+                                (&market.up_token_id, "UP")
+                            };
+
+                            if let Some(tp) = prices.get(watch_token_id) {
+                                let watch_price = tp.price;
+                                if watch_price > 0.0 && watch_price <= config.reversal_threshold {
+                                    info!(
+                                        "[REVERSAL] {} redescend à {:.2}¢ <= seuil={:.2}¢ → BUY {} {:.2}USDC",
+                                        watch_side, watch_price * 100.0, config.reversal_threshold * 100.0,
+                                        reversal_side, config.reversal_amount
+                                    );
+
+                                    match poly_client.buy_market(reversal_token_id, config.reversal_amount, prices.get(reversal_token_id).map(|p| p.price).unwrap_or(0.5)).await {
+                                        Ok(buy_result) => {
+                                            let fill_price = buy_result.fill_price;
+                                            let shares = buy_result.shares;
+                                            let trade_id = uuid::Uuid::new_v4().to_string();
+                                            let latency = (buy_result.ack_at - buy_result.submitted_at).num_milliseconds();
+
+                                            info!(
+                                                "[REVERSAL FILLED] {} | fill={:.2}¢ shares={:.4} | {}ms",
+                                                reversal_side, fill_price * 100.0, shares, latency
+                                            );
+
+                                            let _ = trade_logger.log_trade(&TradeRecord {
+                                                trade_id: trade_id.clone(),
+                                                slug: slug.to_string(),
+                                                token_side: reversal_side.to_string(),
+                                                action: "BUY_REVERSAL".to_string(),
+                                                amount_usdc: format!("{:.2}", config.reversal_amount),
+                                                shares: format!("{:.6}", shares),
+                                                fill_price: format!("{:.4}", fill_price),
+                                                tp_price: String::new(),
+                                                sl_price: String::new(),
+                                                exit_price: String::new(),
+                                                exit_reason: String::new(),
+                                                latency_ms: format!("{}", latency),
+                                                timestamp_utc: Utc::now().to_rfc3339(),
+                                            });
+
+                                            position_mgr.open(OpenPosition {
+                                                trade_id,
+                                                slug: slug.to_string(),
+                                                token_id: reversal_token_id.clone(),
+                                                token_side: reversal_side.to_string(),
+                                                fill_price,
+                                                shares,
+                                                tp_price: 0.0,
+                                                sl_price: 0.0,
+                                                entry_time_utc: Utc::now().to_rfc3339(),
+                                            });
+
+                                            reversal_done = true;
+                                        }
+                                        Err(e) => error!("[REVERSAL BUY] {} Erreur: {}", reversal_side, e),
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
