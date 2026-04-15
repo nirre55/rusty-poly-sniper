@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Datelike, TimeZone, Utc, Weekday};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -118,14 +118,63 @@ async fn main() -> Result<()> {
 
         info!("[MARKET] Résolution du marché: {} ({}s restants)", slug, remaining);
 
-        let market = match poly_client.resolve_market(&slug).await {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Impossible de résoudre le marché {}: {}", slug, e);
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                continue;
+        let market = {
+            let mut attempt = 0u32;
+            loop {
+                match poly_client.resolve_market(&slug).await {
+                    Ok(m) => break m,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("Aucun marché trouvé") {
+                            // Marché pas encore créé par Polymarket — attendre
+                            let delay = match attempt {
+                                0 => 5,
+                                1 => 10,
+                                2 => 15,
+                                _ => 20,
+                            };
+                            if attempt == 0 {
+                                info!("[MARKET] {} pas encore disponible — attente {}s", slug, delay);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        } else {
+                            error!("Impossible de résoudre le marché {}: {}", slug, e);
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        }
+                        attempt += 1;
+                    }
+                }
             }
         };
+
+        // ── Filtre jour de la semaine ────────────────────────────────────────
+        if !config.excluded_days.is_empty() {
+            // Extraire le timestamp Unix depuis le slug (dernier segment)
+            if let Some(ts_str) = slug.rsplit('-').next() {
+                if let Ok(ts) = ts_str.parse::<i64>() {
+                    let dt = Utc.timestamp_opt(ts, 0).single();
+                    if let Some(dt) = dt {
+                        let day_str = match dt.weekday() {
+                            Weekday::Mon => "mon",
+                            Weekday::Tue => "tue",
+                            Weekday::Wed => "wed",
+                            Weekday::Thu => "thu",
+                            Weekday::Fri => "fri",
+                            Weekday::Sat => "sat",
+                            Weekday::Sun => "sun",
+                        };
+                        if config.excluded_days.iter().any(|d| d == day_str) {
+                            info!(
+                                "[FILTRE JOUR] {} ({}) exclu — attente du prochain marché",
+                                slug, day_str
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(remaining as u64 + 1)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
 
         poly_client.warm_sdk_caches(&market).await;
 
@@ -229,6 +278,8 @@ async fn run_market_loop(
     interval_secs: i64,
 ) {
     let mut trade_count: u32 = 0;
+    // Cooldown après un 500 pour éviter les doubles positions
+    let mut buy_cooldown_until: Option<std::time::Instant> = None;
 
     loop {
         tokio::select! {
@@ -317,6 +368,14 @@ async fn run_market_loop(
                     continue;
                 }
 
+                // Cooldown après erreur 500 : évite les doubles positions
+                if let Some(until) = buy_cooldown_until {
+                    if std::time::Instant::now() < until {
+                        continue;
+                    }
+                    buy_cooldown_until = None;
+                }
+
                 for (token_id, token_side) in [
                     (&market.up_token_id, "UP"),
                     (&market.down_token_id, "DOWN"),
@@ -378,7 +437,52 @@ async fn run_market_loop(
                             });
                             trade_count += 1;
                         }
-                        Err(e) => error!("[ENTRY BUY] Erreur: {}", e),
+                        Err(e) => {
+                            error!("[ENTRY BUY] Erreur: {} — vérification ghost order dans 2s", e);
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            // Vérifier si l'ordre a quand même été exécuté côté Polymarket
+                            if let Some((fill_price, shares)) = poly_client.fetch_recent_fill(token_id, 10).await {
+                                let sl_price = calculate_sl(fill_price, config.sl_offset_cents);
+                                let tp_price = calculate_tp(fill_price, config.tp_offset_cents);
+                                let trade_id = uuid::Uuid::new_v4().to_string();
+                                warn!(
+                                    "[GHOST ORDER] Ordre 500 mais fill détecté — {} fill={:.2}¢ shares={:.4}",
+                                    token_side, fill_price * 100.0, shares
+                                );
+                                let _ = trade_logger.log_trade(&TradeRecord {
+                                    trade_id: trade_id.clone(),
+                                    slug: slug.to_string(),
+                                    token_side: token_side.to_string(),
+                                    action: "BUY".to_string(),
+                                    amount_usdc: format!("{:.2}", trade_amount),
+                                    shares: format!("{:.6}", shares),
+                                    fill_price: format!("{:.4}", fill_price),
+                                    tp_price: format!("{:.2}", tp_price),
+                                    sl_price: format!("{:.2}", sl_price),
+                                    exit_price: String::new(),
+                                    exit_reason: String::new(),
+                                    latency_ms: String::new(),
+                                    timestamp_utc: Utc::now().to_rfc3339(),
+                                });
+                                position_mgr.open(OpenPosition {
+                                    trade_id,
+                                    slug: slug.to_string(),
+                                    token_id: token_id.clone(),
+                                    token_side: token_side.to_string(),
+                                    fill_price,
+                                    shares,
+                                    tp_price,
+                                    sl_price,
+                                    entry_time_utc: Utc::now().to_rfc3339(),
+                                });
+                                trade_count += 1;
+                            } else {
+                                // Pas de ghost order, activer le cooldown normal
+                                buy_cooldown_until = Some(
+                                    std::time::Instant::now() + std::time::Duration::from_secs(3)
+                                );
+                            }
+                        }
                     }
                     break;
                 }

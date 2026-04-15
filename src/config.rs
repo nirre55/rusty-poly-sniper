@@ -52,6 +52,8 @@ pub struct Config {
     pub inmarket_max_entries: u32,
     /// Nombre max de trades par marché en mode market. 0 = illimité.
     pub market_max_trades: u32,
+    /// Jours exclus du trading (ex: ["sat","sun"]). Vide = pas de filtre.
+    pub excluded_days: Vec<String>,
     /// Seuil reversal : si le dernier côté entré redescend à ce prix, on ouvre sur l'opposé. 0.0 = désactivé.
     pub reversal_threshold: f64,
     /// Montant du trade reversal en USDC.
@@ -79,6 +81,7 @@ impl std::fmt::Debug for Config {
             .field("inmarket_multiplier", &self.inmarket_multiplier)
             .field("inmarket_max_entries", &self.inmarket_max_entries)
             .field("market_max_trades", &self.market_max_trades)
+            .field("excluded_days", &self.excluded_days)
             .field("reversal_threshold", &self.reversal_threshold)
             .field("reversal_amount", &self.reversal_amount)
             .field("logs_dir", &self.logs_dir)
@@ -179,6 +182,13 @@ impl Config {
             .and_then(|v| v.parse::<u32>().ok())
             .unwrap_or(0);
 
+        let excluded_days = env::var("EXCLUDED_DAYS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         let reversal_threshold = env::var("REVERSAL_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
@@ -208,6 +218,7 @@ impl Config {
             inmarket_multiplier,
             inmarket_max_entries,
             market_max_trades,
+            excluded_days,
             reversal_threshold,
             reversal_amount,
             logs_dir: env::var("LOGS_DIR").unwrap_or_else(|_| "logs".to_string()),

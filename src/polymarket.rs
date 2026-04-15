@@ -361,7 +361,7 @@ impl PolymarketClient {
             .amount(Amount::usdc(amount).map_err(|e| anyhow!("Amount: {}", e))?)
             .price(max_price)
             .side(SdkSide::Buy)
-            .order_type(SdkOrderType::FOK)
+            .order_type(SdkOrderType::FAK)
             .build()
             .await
             .map_err(|e| anyhow!("SDK build: {}", e))?;
@@ -385,6 +385,11 @@ impl PolymarketClient {
         let making: f64 = resp.making_amount.to_string().parse().unwrap_or(0.0);
         let taking: f64 = resp.taking_amount.to_string().parse().unwrap_or(0.0);
         let fill_price = if taking > 0.0 { making / taking } else { 0.0 };
+
+        // FAK : fill partiel possible — si taking == 0, rien n'a été rempli
+        if taking <= 0.0 {
+            return Err(anyhow!("FAK order zero fill — aucune liquidité disponible"));
+        }
 
         info!(
             "[BUY] token={} amount={:.2}USDC | fill={:.4} shares={:.4} | {}ms (client={}ms build={}ms sign={}ms post={}ms)",
@@ -436,7 +441,7 @@ impl PolymarketClient {
             )
             .price(min_price)
             .side(SdkSide::Sell)
-            .order_type(SdkOrderType::FOK)
+            .order_type(SdkOrderType::FAK)
             .build()
             .await
             .map_err(|e| anyhow!("SDK build sell: {}", e))?;
@@ -460,6 +465,11 @@ impl PolymarketClient {
         let taking: f64 = resp.taking_amount.to_string().parse().unwrap_or(0.0);
         // Pour SELL : making = shares vendues, taking = USDC reçus
         let fill_price = if making > 0.0 { taking / making } else { 0.0 };
+
+        // FAK : si making == 0, rien n'a été vendu
+        if making <= 0.0 {
+            return Err(anyhow!("FAK sell zero fill — aucune liquidité disponible"));
+        }
 
         info!(
             "[SELL] token={} shares={:.4} | fill={:.4} usdc_received={:.4} | {}ms (client={}ms build={}ms sign={}ms post={}ms)",
@@ -523,6 +533,20 @@ impl PolymarketClient {
                 Err(e) if Self::is_balance_error(&e) => {
                     if let Some(balance) = Self::extract_balance(&e) {
                         let adjusted = (balance / 1_000_000.0 * 100.0).floor() / 100.0;
+                        if adjusted <= 0.0 {
+                            // Solde 0 = marché déjà réglé par Polymarket, shares rachetées automatiquement
+                            warn!(
+                                "[SELL] Solde 0 — marché déjà réglé, position fermée sans vente"
+                            );
+                            return Ok(OrderResult {
+                                order_id: "market-settled".to_string(),
+                                status: "settled".to_string(),
+                                fill_price: 0.0,
+                                shares: 0.0,
+                                submitted_at,
+                                ack_at: Utc::now(),
+                            });
+                        }
                         warn!(
                             "[SELL] Balance insuffisante — retry avec solde réel: {:.4} shares (demandé: {:.4})",
                             adjusted, current_shares
@@ -721,10 +745,60 @@ impl PolymarketClient {
         Ok(())
     }
 
+    /// Vérifie si un trade BUY a été exécuté sur ce token dans les N dernières secondes.
+    /// Utilisé pour détecter les ordres "ghost" après un 500.
+    pub async fn fetch_recent_fill(
+        &self,
+        token_id: &str,
+        within_secs: i64,
+    ) -> Option<(f64, f64)> {
+        let address = self.sdk_signer.as_ref()?.address().to_string().to_lowercase();
+
+        #[derive(Deserialize)]
+        struct Trade {
+            side: String,
+            price: String,
+            size: String,
+            #[serde(rename = "matchTime")]
+            match_time: Option<String>,
+        }
+
+        let url = format!(
+            "{}/data/trades?maker_address={}&asset_id={}",
+            CLOB_API_BASE, address, token_id
+        );
+
+        let resp = self.http.get(&url).send().await.ok()?;
+        let trades: Vec<Trade> = resp.json().await.ok()?;
+
+        let cutoff = Utc::now().timestamp() - within_secs;
+        for trade in &trades {
+            if !trade.side.eq_ignore_ascii_case("buy") {
+                continue;
+            }
+            // Vérifier si le trade est récent (si match_time disponible)
+            if let Some(ref mt) = trade.match_time {
+                if let Ok(ts) = mt.parse::<i64>() {
+                    if ts < cutoff {
+                        continue;
+                    }
+                }
+            }
+            let price: f64 = trade.price.parse().unwrap_or(0.0);
+            let size: f64 = trade.size.parse().unwrap_or(0.0);
+            if price > 0.0 && size > 0.0 {
+                return Some((price, size));
+            }
+        }
+        None
+    }
+
     fn is_fok_unfilled(err: &anyhow::Error) -> bool {
         let msg = err.to_string().to_ascii_lowercase();
         msg.contains("fok orders are fully filled or killed")
             || msg.contains("order couldn't be fully filled")
+            || msg.contains("fak order zero fill")
+            || msg.contains("could not run the execution")
     }
 
     fn is_balance_error(err: &anyhow::Error) -> bool {
