@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{Datelike, TimeZone, Utc, Weekday};
+use chrono::{Datelike, Timelike, TimeZone, Utc, Weekday};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -52,6 +52,8 @@ fn spawn_prefetch_next_market(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -62,15 +64,35 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let interval_secs = config.interval_seconds()?;
 
+    let tp_display = if config.tp_disabled {
+        "disabled (expiration)".to_string()
+    } else if let Some(p) = config.tp_price_fixed {
+        format!("{:.0}¢ (fixed)", p * 100.0)
+    } else {
+        format!("+{:.0}¢ (offset)", config.tp_offset_cents)
+    };
+
+    let sl_display = if let Some(p) = config.sl_price_fixed {
+        format!("{:.0}¢ (fixed)", p * 100.0)
+    } else {
+        format!("-{:.0}¢ (offset)", config.sl_offset_cents)
+    };
+
+    let amount_display = if config.trade_amount_pct > 0.0 {
+        format!("{:.1}% du solde", config.trade_amount_pct)
+    } else {
+        format!("{:.2} USDC", config.trade_amount_usdc)
+    };
+
     info!(
-        "Démarrage rusty-poly-sniper | mode={:?} prefix={} interval={} entry={}¢ TP=+{}¢ SL=-{}¢ amount={:.2}USDC",
-        config.execution_mode,
+        "Démarrage rusty-poly-sniper | mode={} prefix={} interval={} entry={}¢ | TP={} SL={} | montant={}",
+        config.execution_mode.as_str(),
         config.polymarket_slug_prefix,
         config.interval,
         (config.entry_threshold * 100.0) as u32,
-        config.tp_offset_cents,
-        config.sl_offset_cents,
-        config.trade_amount_usdc
+        tp_display,
+        sl_display,
+        amount_display,
     );
 
     let trade_logger = Arc::new(TradeLogger::new(&config.logs_dir)?);
@@ -119,14 +141,19 @@ async fn main() -> Result<()> {
         info!("[MARKET] Résolution du marché: {} ({}s restants)", slug, remaining);
 
         let market = {
+            let market_deadline = Utc::now() + chrono::Duration::seconds(remaining);
             let mut attempt = 0u32;
+            let mut resolved = None;
             loop {
+                if Utc::now() >= market_deadline {
+                    info!("[MARKET] {} introuvable — slot expiré, passage au suivant", slug);
+                    break;
+                }
                 match poly_client.resolve_market(&slug).await {
-                    Ok(m) => break m,
+                    Ok(m) => { resolved = Some(m); break; }
                     Err(e) => {
                         let msg = e.to_string();
                         if msg.contains("Aucun marché trouvé") {
-                            // Marché pas encore créé par Polymarket — attendre
                             let delay = match attempt {
                                 0 => 5,
                                 1 => 10,
@@ -143,6 +170,13 @@ async fn main() -> Result<()> {
                         }
                         attempt += 1;
                     }
+                }
+            }
+            match resolved {
+                Some(m) => m,
+                None => {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
                 }
             }
         };
@@ -173,6 +207,41 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+            }
+        }
+
+        // ── Filtre heure (UTC) ───────────────────────────────────────────────
+        if !config.excluded_hours.is_empty() {
+            if let Some(ts_str) = slug.rsplit('-').next() {
+                if let Ok(ts) = ts_str.parse::<i64>() {
+                    if let Some(dt) = Utc.timestamp_opt(ts, 0).single() {
+                        let hour = dt.hour();
+                        if config.excluded_hours.iter().any(|&(start, end)| hour >= start && hour < end) {
+                            info!(
+                                "[FILTRE HEURE] {} ({}h UTC) exclu — attente du prochain marché",
+                                slug, hour
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(remaining as u64 + 1)).await;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Mode pourcentage : recalcul du montant de base sur le solde USDC ──
+        if config.trade_amount_pct > 0.0 && config.execution_mode != ExecutionMode::DryRun {
+            match poly_client.get_usdc_balance().await {
+                Ok(balance) => {
+                    let pct_amount = (balance * config.trade_amount_pct / 100.0 * 100.0).floor() / 100.0;
+                    let amount = pct_amount.max(1.0);
+                    info!(
+                        "[MONEY] Solde USDC = {:.2} | {:.1}% = {:.2} USDC (min 1$)",
+                        balance, config.trade_amount_pct, amount
+                    );
+                    money_manager.lock().await.set_base_amount(amount);
+                }
+                Err(e) => warn!("[MONEY] Impossible de récupérer le solde USDC — montant inchangé: {}", e),
             }
         }
 
@@ -278,6 +347,8 @@ async fn run_market_loop(
     interval_secs: i64,
 ) {
     let mut trade_count: u32 = 0;
+    // Deadline = expiration du marché courant (pour retry SELL)
+    let market_deadline = Utc::now() + chrono::Duration::seconds(seconds_until_market_end(interval_secs));
     // Cooldown après un 500 pour éviter les doubles positions
     let mut buy_cooldown_until: Option<std::time::Instant> = None;
 
@@ -291,7 +362,14 @@ async fn run_market_loop(
                 info!("[MARKET] Marché {} expiré — passage au suivant", slug);
                 let leftover = position_mgr.clear_slug(slug);
                 for pos in &leftover {
-                    warn!("[POSITION] {} non fermée avant expiration", pos.trade_id);
+                    // Annuler le limit TP GTC si présent (marché réglé automatiquement)
+                    if let Some(ref oid) = pos.tp_order_id {
+                        if let Err(e) = poly_client.cancel_order(oid).await {
+                            warn!("[TP LIMIT] Annulation fin de marché échouée (déjà fill?): {}", e);
+                        }
+                    }
+                    warn!("[POSITION] {} non fermée — comptée comme WIN (résolution marché)", pos.trade_id);
+                    money_manager.lock().await.on_outcome("WIN");
                 }
                 break;
             }
@@ -318,23 +396,31 @@ async fn run_market_loop(
                     let current_price = tp.price;
                     if current_price <= 0.0 { continue; }
 
-                    if current_price >= pos.tp_price {
+                    if !config.tp_disabled && current_price >= pos.tp_price {
                         info!(
                             "[TP HIT] {} price={:.2}¢ >= TP={:.2}¢ | trade_id={}",
                             pos.token_side, current_price * 100.0, pos.tp_price * 100.0, pos.trade_id
                         );
-                        match poly_client.sell_market(&pos.token_id, pos.shares).await {
+                        // Annuler le limit order GTC (si déjà fill, cancel échoue silencieusement)
+                        if let Some(ref oid) = pos.tp_order_id {
+                            if let Err(e) = poly_client.cancel_order(oid).await {
+                                warn!("[TP LIMIT] Annulation TP échouée (déjà fill?): {}", e);
+                            }
+                        }
+                        match poly_client.sell_market(&pos.token_id, pos.shares, market_deadline).await {
                             Ok(sell_result) => {
                                 let latency = (sell_result.ack_at - sell_result.submitted_at).num_milliseconds();
                                 log_exit(trade_logger, &pos, "TP", sell_result.fill_price, latency);
                                 position_mgr.close(&pos.trade_id);
-
+                                trade_count += 1;
                                 money_manager.lock().await.on_outcome("WIN");
+                                refresh_pct_balance(config, poly_client, money_manager).await;
                             }
                             Err(e) => {
                                 error!("[TP SELL FAILED] {} — position fermée avec erreur", e);
+                                log_exit(trade_logger, &pos, "TP_SELL_FAILED", current_price, 0);
                                 position_mgr.close(&pos.trade_id);
-
+                                trade_count += 1;
                             }
                         }
                     } else if current_price <= pos.sl_price {
@@ -342,18 +428,26 @@ async fn run_market_loop(
                             "[SL HIT] {} price={:.2}¢ <= SL={:.2}¢ | trade_id={}",
                             pos.token_side, current_price * 100.0, pos.sl_price * 100.0, pos.trade_id
                         );
-                        match poly_client.sell_market(&pos.token_id, pos.shares).await {
+                        // Annuler le limit TP GTC avant de vendre au marché
+                        if let Some(ref oid) = pos.tp_order_id {
+                            if let Err(e) = poly_client.cancel_order(oid).await {
+                                warn!("[TP LIMIT] Annulation SL échouée (déjà fill?): {}", e);
+                            }
+                        }
+                        match poly_client.sell_market(&pos.token_id, pos.shares, market_deadline).await {
                             Ok(sell_result) => {
                                 let latency = (sell_result.ack_at - sell_result.submitted_at).num_milliseconds();
                                 log_exit(trade_logger, &pos, "SL", sell_result.fill_price, latency);
                                 position_mgr.close(&pos.trade_id);
-
+                                trade_count += 1;
                                 money_manager.lock().await.on_outcome("LOSS");
+                                refresh_pct_balance(config, poly_client, money_manager).await;
                             }
                             Err(e) => {
                                 error!("[SL SELL FAILED] {} — position fermée avec erreur", e);
+                                log_exit(trade_logger, &pos, "SL_SELL_FAILED", current_price, 0);
                                 position_mgr.close(&pos.trade_id);
-
+                                trade_count += 1;
                             }
                         }
                     }
@@ -376,11 +470,11 @@ async fn run_market_loop(
                     buy_cooldown_until = None;
                 }
 
-                for (token_id, token_side) in [
-                    (&market.up_token_id, "UP"),
-                    (&market.down_token_id, "DOWN"),
+                for (signal_token_id, signal_side, buy_token_id, buy_side) in [
+                    (&market.up_token_id, "UP", if config.reverse_entry { &market.down_token_id } else { &market.up_token_id }, if config.reverse_entry { "DOWN" } else { "UP" }),
+                    (&market.down_token_id, "DOWN", if config.reverse_entry { &market.up_token_id } else { &market.down_token_id }, if config.reverse_entry { "UP" } else { "DOWN" }),
                 ] {
-                    let Some(tp) = prices.get(token_id) else { continue };
+                    let Some(tp) = prices.get(signal_token_id) else { continue };
                     let token_price = tp.price;
                     if token_price <= 0.0 || token_price >= 1.0 { continue; }
 
@@ -390,16 +484,22 @@ async fn run_market_loop(
 
                     let trade_amount = money_manager.lock().await.current_amount();
                     info!(
-                        "[ENTRY SIGNAL] {} price={:.2}¢ >= seuil={:.2}¢ | montant={:.2}USDC",
-                        token_side, token_price * 100.0, config.entry_threshold * 100.0, trade_amount
+                        "[ENTRY SIGNAL] {} price={:.2}¢ >= seuil={:.2}¢{} | montant={:.2}USDC",
+                        signal_side, token_price * 100.0, config.entry_threshold * 100.0,
+                        if config.reverse_entry { format!(" → achat {}", buy_side) } else { String::new() },
+                        trade_amount
                     );
 
+                    let token_id = buy_token_id;
+                    let token_side = buy_side;
                     match poly_client.buy_market(token_id, trade_amount, token_price).await {
                         Ok(buy_result) => {
                             let fill_price = buy_result.fill_price;
                             let shares = buy_result.shares;
-                            let tp_price = calculate_tp(fill_price, config.tp_offset_cents);
-                            let sl_price = calculate_sl(fill_price, config.sl_offset_cents);
+                            let tp_price = config.tp_price_fixed
+                                .unwrap_or_else(|| calculate_tp(fill_price, config.tp_offset_cents));
+                            let sl_price = config.sl_price_fixed
+                                .unwrap_or_else(|| calculate_sl(fill_price, config.sl_offset_cents));
                             let trade_id = uuid::Uuid::new_v4().to_string();
                             let latency = (buy_result.ack_at - buy_result.submitted_at).num_milliseconds();
 
@@ -424,8 +524,9 @@ async fn run_market_loop(
                                 timestamp_utc: Utc::now().to_rfc3339(),
                             });
 
+                            // Ouvrir la position d'abord (sans tp_order_id)
                             position_mgr.open(OpenPosition {
-                                trade_id,
+                                trade_id: trade_id.clone(),
                                 slug: slug.to_string(),
                                 token_id: token_id.clone(),
                                 token_side: token_side.to_string(),
@@ -434,54 +535,40 @@ async fn run_market_loop(
                                 tp_price,
                                 sl_price,
                                 entry_time_utc: Utc::now().to_rfc3339(),
+                                tp_order_id: None,
                             });
-                            trade_count += 1;
+
+                            // Placer le limit sell GTC au TP seulement si TP activé et shares > 5
+                            let tp_limit_price = tp_price.min(0.99);
+                            let tp_order_id = if !config.tp_disabled && shares > 5.0 {
+                                match poly_client.place_limit_sell(token_id, shares, tp_limit_price).await {
+                                    Ok(r) => {
+                                        info!(
+                                            "[TP LIMIT] GTC limit sell placé à {:.2}¢ | order_id={}",
+                                            tp_limit_price * 100.0, r.order_id
+                                        );
+                                        Some(r.order_id)
+                                    }
+                                    Err(e) => {
+                                        warn!("[TP LIMIT] Placement échoué — fallback monitoring prix: {}", e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                info!("[TP LIMIT] Skipped — shares={:.4} <= 5 (monitoring prix uniquement)", shares);
+                                None
+                            };
+
+                            // Mettre à jour la position avec le tp_order_id
+                            if let Some(oid) = tp_order_id {
+                                position_mgr.set_tp_order_id(&trade_id, oid);
+                            }
                         }
                         Err(e) => {
-                            error!("[ENTRY BUY] Erreur: {} — vérification ghost order dans 2s", e);
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            // Vérifier si l'ordre a quand même été exécuté côté Polymarket
-                            if let Some((fill_price, shares)) = poly_client.fetch_recent_fill(token_id, 10).await {
-                                let sl_price = calculate_sl(fill_price, config.sl_offset_cents);
-                                let tp_price = calculate_tp(fill_price, config.tp_offset_cents);
-                                let trade_id = uuid::Uuid::new_v4().to_string();
-                                warn!(
-                                    "[GHOST ORDER] Ordre 500 mais fill détecté — {} fill={:.2}¢ shares={:.4}",
-                                    token_side, fill_price * 100.0, shares
-                                );
-                                let _ = trade_logger.log_trade(&TradeRecord {
-                                    trade_id: trade_id.clone(),
-                                    slug: slug.to_string(),
-                                    token_side: token_side.to_string(),
-                                    action: "BUY".to_string(),
-                                    amount_usdc: format!("{:.2}", trade_amount),
-                                    shares: format!("{:.6}", shares),
-                                    fill_price: format!("{:.4}", fill_price),
-                                    tp_price: format!("{:.2}", tp_price),
-                                    sl_price: format!("{:.2}", sl_price),
-                                    exit_price: String::new(),
-                                    exit_reason: String::new(),
-                                    latency_ms: String::new(),
-                                    timestamp_utc: Utc::now().to_rfc3339(),
-                                });
-                                position_mgr.open(OpenPosition {
-                                    trade_id,
-                                    slug: slug.to_string(),
-                                    token_id: token_id.clone(),
-                                    token_side: token_side.to_string(),
-                                    fill_price,
-                                    shares,
-                                    tp_price,
-                                    sl_price,
-                                    entry_time_utc: Utc::now().to_rfc3339(),
-                                });
-                                trade_count += 1;
-                            } else {
-                                // Pas de ghost order, activer le cooldown normal
-                                buy_cooldown_until = Some(
-                                    std::time::Instant::now() + std::time::Duration::from_secs(3)
-                                );
-                            }
+                            error!("[ENTRY BUY] Erreur: {} — cooldown 5s", e);
+                            buy_cooldown_until = Some(
+                                std::time::Instant::now() + std::time::Duration::from_secs(5)
+                            );
                         }
                     }
                     break;
@@ -489,6 +576,39 @@ async fn run_market_loop(
             }
         }
     }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Rafraîchit le base_amount du MoneyManager depuis la balance USDC réelle (mode PCT uniquement).
+/// Appelé immédiatement après un TP ou SL fill pour que le prochain trade utilise le bon capital.
+async fn refresh_pct_balance(
+    config: &Config,
+    poly_client: &Arc<PolymarketClient>,
+    money_manager: &Arc<tokio::sync::Mutex<MoneyManager>>,
+) {
+    if config.trade_amount_pct <= 0.0 || config.execution_mode == ExecutionMode::DryRun {
+        return;
+    }
+    // Retry jusqu'à ce que le CLOB ait crédité l'USDC du sell (max ~2.5s)
+    for delay_ms in [300u64, 700, 1500] {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        match poly_client.get_usdc_balance().await {
+            Ok(balance) if balance > 0.0 => {
+                let amount = (balance * config.trade_amount_pct / 100.0 * 100.0).floor() / 100.0;
+                let amount = amount.max(1.0);
+                info!("[MONEY] Balance post-trade: {:.2}$ → prochain montant = {:.2}$", balance, amount);
+                money_manager.lock().await.set_base_amount(amount);
+                return;
+            }
+            Ok(_) => warn!("[MONEY] Balance USDC encore 0 après {}ms, retry...", delay_ms),
+            Err(e) => {
+                warn!("[MONEY] Balance refresh post-trade échoué: {}", e);
+                return;
+            }
+        }
+    }
+    warn!("[MONEY] Balance USDC toujours 0 après retries — montant inchangé");
 }
 
 // ── Mode LIMIT ──────────────────────────────────────────────────────────────
@@ -636,6 +756,7 @@ async fn run_no_tp_no_sl_loop(
                                 tp_price: 0.0,
                                 sl_price: 0.0,
                                 entry_time_utc: Utc::now().to_rfc3339(),
+                                tp_order_id: None,
                             });
 
                             sides_touched.insert(token_side.to_string());
@@ -721,6 +842,7 @@ async fn run_no_tp_no_sl_loop(
                                                 tp_price: 0.0,
                                                 sl_price: 0.0,
                                                 entry_time_utc: Utc::now().to_rfc3339(),
+                                                tp_order_id: None,
                                             });
 
                                             reversal_done = true;

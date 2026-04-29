@@ -1,16 +1,17 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::{
-    Amount, OrderType as SdkOrderType, Side as SdkSide, SignatureType as SdkSignatureType,
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::clob::types::{
+    Amount, AssetType, OrderType as SdkOrderType, Side as SdkSide, SignatureType as SdkSignatureType,
 };
-use polymarket_client_sdk::clob::{Client as SdkClobClient, Config as SdkConfig};
-use polymarket_client_sdk::types::Decimal;
-use polymarket_client_sdk::POLYGON;
+use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::{Client as SdkClobClient, Config as SdkConfig};
+use polymarket_client_sdk_v2::types::Decimal;
+use polymarket_client_sdk_v2::POLYGON;
 use serde::Deserialize;
 use std::str::FromStr;
 use std::time::Duration;
@@ -126,10 +127,12 @@ impl PolymarketClient {
             Ok(c) => c,
             Err(_) => return,
         };
-        for token_id in [&market.up_token_id, &market.down_token_id] {
-            let _ = client.tick_size(token_id).await;
-            let _ = client.fee_rate_bps(token_id).await;
-            let _ = client.neg_risk(token_id).await;
+        for token_id_str in [&market.up_token_id, &market.down_token_id] {
+            if let Ok(tid) = token_id_str.parse::<U256>() {
+                let _ = client.tick_size(tid).await;
+                let _ = client.fee_rate_bps(tid).await;
+                let _ = client.neg_risk(tid).await;
+            }
         }
     }
 
@@ -260,11 +263,13 @@ impl PolymarketClient {
             .await
     }
 
-    /// Place un ordre SELL market FOK pour toutes les shares.
+    /// Place un ordre SELL market FAK pour toutes les shares.
+    /// Retry jusqu'à `deadline` (expiration du marché) en cas d'échec.
     pub async fn sell_market(
         &self,
         token_id: &str,
         shares: f64,
+        deadline: DateTime<Utc>,
     ) -> Result<OrderResult> {
         let submitted_at = Utc::now();
 
@@ -284,7 +289,7 @@ impl PolymarketClient {
             });
         }
 
-        self.submit_sell_with_retry(token_id, submitted_at, shares)
+        self.submit_sell_with_retry(token_id, submitted_at, shares, deadline)
             .await
     }
 
@@ -354,10 +359,11 @@ impl PolymarketClient {
             .map_err(|e| anyhow!("Decimal: {}", e))?;
         let max_price =
             Decimal::from_str("0.99").map_err(|e| anyhow!("Decimal: {}", e))?;
+        let tid = token_id.parse::<U256>().map_err(|e| anyhow!("token_id U256: {}", e))?;
 
         let order = client
             .market_order()
-            .token_id(token_id)
+            .token_id(tid)
             .amount(Amount::usdc(amount).map_err(|e| anyhow!("Amount: {}", e))?)
             .price(max_price)
             .side(SdkSide::Buy)
@@ -432,10 +438,11 @@ impl PolymarketClient {
         // Prix plancher 0.01 pour SELL market (garantir le fill au meilleur bid)
         let min_price =
             Decimal::from_str("0.01").map_err(|e| anyhow!("Decimal: {}", e))?;
+        let tid = token_id.parse::<U256>().map_err(|e| anyhow!("token_id U256: {}", e))?;
 
         let order = client
             .market_order()
-            .token_id(token_id)
+            .token_id(tid)
             .amount(
                 Amount::shares(share_amount).map_err(|e| anyhow!("Amount: {}", e))?,
             )
@@ -521,9 +528,10 @@ impl PolymarketClient {
         token_id: &str,
         submitted_at: DateTime<Utc>,
         shares: f64,
+        deadline: DateTime<Utc>,
     ) -> Result<OrderResult> {
         let mut current_shares = shares;
-        let mut attempt = 0usize;
+        let mut attempt = 0u32;
         loop {
             match self
                 .submit_sell_order(token_id, submitted_at, current_shares)
@@ -552,22 +560,25 @@ impl PolymarketClient {
                             adjusted, current_shares
                         );
                         current_shares = adjusted;
+                        // pas de délai, on relance immédiatement avec le bon montant
                         continue;
                     }
                     return Err(e);
                 }
-                Err(e) if Self::is_fok_unfilled(&e) && attempt < FOK_RETRY_DELAYS_SECS.len() => {
-                    let delay = FOK_RETRY_DELAYS_SECS[attempt];
-                    warn!(
-                        "SELL FOK non rempli — retry {}/{} dans {}s",
-                        attempt + 1,
-                        FOK_RETRY_DELAYS_SECS.len(),
-                        delay
-                    );
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                Err(e) => {
+                    if Utc::now() >= deadline {
+                        warn!("[SELL] Deadline marché atteinte après {} tentatives — abandon", attempt + 1);
+                        return Err(e);
+                    }
                     attempt += 1;
+                    warn!(
+                        "[SELL] Échec tentative {} — retry dans 3s (deadline dans {}s) | {}",
+                        attempt,
+                        (deadline - Utc::now()).num_seconds().max(0),
+                        e
+                    );
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -598,10 +609,11 @@ impl PolymarketClient {
             .map_err(|e| anyhow!("Decimal: {}", e))?;
         let shares = Decimal::from_str(&format!("{:.2}", final_shares))
             .map_err(|e| anyhow!("Decimal: {}", e))?;
+        let tid = token_id.parse::<U256>().map_err(|e| anyhow!("token_id U256: {}", e))?;
 
         let order = client
             .limit_order()
-            .token_id(token_id)
+            .token_id(tid)
             .price(price)
             .size(shares)
             .side(SdkSide::Buy)
@@ -662,55 +674,73 @@ impl PolymarketClient {
         let client = self.get_or_create_sdk_client().await?;
         let t_client = t0.elapsed().as_millis();
 
+        // Délai pour laisser le CLOB enregistrer les tokens reçus après le BUY
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
         let truncated_shares = (shares * 100.0).floor() / 100.0;
-        let size = Decimal::from_str(&format!("{:.2}", truncated_shares))
-            .map_err(|e| anyhow!("Decimal: {}", e))?;
         let price = Decimal::from_str(&format!("{:.2}", limit_price))
             .map_err(|e| anyhow!("Decimal: {}", e))?;
+        let tid = token_id.parse::<U256>().map_err(|e| anyhow!("token_id U256: {}", e))?;
 
-        let order = client
-            .limit_order()
-            .token_id(token_id)
-            .price(price)
-            .size(size)
-            .side(SdkSide::Sell)
-            .order_type(SdkOrderType::GTC)
-            .build()
-            .await
-            .map_err(|e| anyhow!("SDK build limit sell: {}", e))?;
-        let t_build = t0.elapsed().as_millis();
+        // Retry si balance insuffisante (ajustement des shares comme pour sell_market)
+        let mut current_shares = truncated_shares;
+        loop {
+            let size = Decimal::from_str(&format!("{:.2}", current_shares))
+                .map_err(|e| anyhow!("Decimal: {}", e))?;
 
-        let signed = client
-            .sign(sdk_signer, order)
-            .await
-            .map_err(|e| anyhow!("SDK sign limit sell: {}", e))?;
-        let t_sign = t0.elapsed().as_millis();
+            let order = client
+                .limit_order()
+                .token_id(tid)
+                .price(price)
+                .size(size)
+                .side(SdkSide::Sell)
+                .order_type(SdkOrderType::GTC)
+                .build()
+                .await
+                .map_err(|e| anyhow!("SDK build limit sell: {}", e))?;
+            let t_build = t0.elapsed().as_millis();
 
-        let resp = client
-            .post_order(signed)
-            .await
-            .map_err(|e| anyhow!("SDK post_order limit sell: {}", e))?;
+            let signed = client
+                .sign(sdk_signer, order)
+                .await
+                .map_err(|e| anyhow!("SDK sign limit sell: {}", e))?;
+            let t_sign = t0.elapsed().as_millis();
 
-        let ack_at = Utc::now();
-        let total_ms = t0.elapsed().as_millis();
-
-        let order_id = format!("{:?}", resp.order_id).trim_matches('"').to_string();
-
-        info!(
-            "[LIMIT SELL PLACED] token={} price={:.2}¢ shares={:.4} | {}ms (client={}ms build={}ms sign={}ms post={}ms) | order_id={}",
-            &token_id[..8], limit_price * 100.0, shares, total_ms,
-            t_client, t_build - t_client, t_sign - t_build, total_ms - t_sign,
-            &order_id
-        );
-
-        Ok(OrderResult {
-            order_id,
-            status: format!("{:?}", resp.status).trim_matches('"').to_string(),
-            fill_price: limit_price,
-            shares: truncated_shares,
-            submitted_at: Utc::now(),
-            ack_at,
-        })
+            match client.post_order(signed).await {
+                Ok(resp) => {
+                    let ack_at = Utc::now();
+                    let total_ms = t0.elapsed().as_millis();
+                    let order_id = format!("{:?}", resp.order_id).trim_matches('"').to_string();
+                    info!(
+                        "[LIMIT SELL PLACED] token={} price={:.2}¢ shares={:.4} | {}ms (client={}ms build={}ms sign={}ms post={}ms) | order_id={}",
+                        &token_id[..8], limit_price * 100.0, current_shares, total_ms,
+                        t_client, t_build - t_client, t_sign - t_build, total_ms - t_sign,
+                        &order_id
+                    );
+                    return Ok(OrderResult {
+                        order_id,
+                        status: format!("{:?}", resp.status).trim_matches('"').to_string(),
+                        fill_price: limit_price,
+                        shares: current_shares,
+                        submitted_at: Utc::now(),
+                        ack_at,
+                    });
+                }
+                Err(e) if Self::is_balance_error(&anyhow!("{}", e)) => {
+                    if let Some(balance) = Self::extract_balance(&anyhow!("{}", e)) {
+                        let adjusted = (balance / 1_000_000.0 * 100.0).floor() / 100.0;
+                        if adjusted <= 0.0 {
+                            return Err(anyhow!("SDK post_order limit sell: {}", e));
+                        }
+                        warn!("[LIMIT SELL] Balance insuffisante — retry avec {:.4} shares (demandé: {:.4})", adjusted, current_shares);
+                        current_shares = adjusted;
+                    } else {
+                        return Err(anyhow!("SDK post_order limit sell: {}", e));
+                    }
+                }
+                Err(e) => return Err(anyhow!("SDK post_order limit sell: {}", e)),
+            }
+        }
     }
 
     /// Annule un ordre par son ID.
@@ -745,12 +775,12 @@ impl PolymarketClient {
         Ok(())
     }
 
-    /// Vérifie si un trade BUY a été exécuté sur ce token dans les N dernières secondes.
+    /// Vérifie si un trade BUY a été exécuté sur ce token après `submitted_at`.
     /// Utilisé pour détecter les ordres "ghost" après un 500.
     pub async fn fetch_recent_fill(
         &self,
         token_id: &str,
-        within_secs: i64,
+        submitted_at: DateTime<Utc>,
     ) -> Option<(f64, f64)> {
         let address = self.sdk_signer.as_ref()?.address().to_string().to_lowercase();
 
@@ -771,12 +801,12 @@ impl PolymarketClient {
         let resp = self.http.get(&url).send().await.ok()?;
         let trades: Vec<Trade> = resp.json().await.ok()?;
 
-        let cutoff = Utc::now().timestamp() - within_secs;
+        let cutoff = submitted_at.timestamp();
         for trade in &trades {
             if !trade.side.eq_ignore_ascii_case("buy") {
                 continue;
             }
-            // Vérifier si le trade est récent (si match_time disponible)
+            // N'accepter que les fills postérieurs à la soumission de l'ordre
             if let Some(ref mt) = trade.match_time {
                 if let Ok(ts) = mt.parse::<i64>() {
                     if ts < cutoff {
@@ -791,6 +821,20 @@ impl PolymarketClient {
             }
         }
         None
+    }
+
+    /// Retourne le solde USDC disponible (collateral) depuis le CLOB.
+    pub async fn get_usdc_balance(&self) -> Result<f64> {
+        let client = self.get_or_create_sdk_client().await?;
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        // Forcer le CLOB à rafraîchir sa vue du solde on-chain avant de le lire
+        let _ = client.update_balance_allowance(req.clone()).await;
+        let resp = client.balance_allowance(req).await
+            .map_err(|e| anyhow!("get_usdc_balance échoué: {}", e))?;
+        let raw: f64 = resp.balance.to_string().parse().unwrap_or(0.0);
+        Ok((raw / 1_000_000.0 * 100.0).floor() / 100.0)
     }
 
     fn is_fok_unfilled(err: &anyhow::Error) -> bool {

@@ -20,5 +20,6 @@ alloy = { version = "1", features = ["signer-local", "signers"] }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
-polymarket-client-sdk = { version = "0.3", features = ["ws"] }
+polymarket_client_sdk_v2 = { version = "0.5.1", features = ["ws", "clob"] }
+rustls = { version = "0.23", features = ["ring"], default-features = false }
 rust_decimal = "1"

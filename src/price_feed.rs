@@ -1,6 +1,7 @@
+use alloy::primitives::U256;
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
-use polymarket_client_sdk::clob::ws::Client as WsClient;
+use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -36,8 +37,13 @@ pub async fn stream_prices(
         asset_ids.len()
     );
 
+    let u256_ids: Vec<U256> = asset_ids
+        .iter()
+        .filter_map(|s| s.parse::<U256>().ok())
+        .collect();
+
     let stream = ws_client
-        .subscribe_best_bid_ask(asset_ids.clone())
+        .subscribe_best_bid_ask(u256_ids)
         .map_err(|e| anyhow!("Erreur souscription best_bid_ask WS: {}", e))?;
 
     let mut stream = Box::pin(stream);
@@ -56,9 +62,10 @@ pub async fn stream_prices(
                     best_bid
                 };
 
+                let asset_id_str = bba.asset_id.to_string();
                 debug!(
                     "[PRICE] {} bid={:.2}¢ ask={:.2}¢ mid={:.2}¢",
-                    &bba.asset_id[..8.min(bba.asset_id.len())],
+                    &asset_id_str[..8.min(asset_id_str.len())],
                     best_bid * 100.0,
                     best_ask * 100.0,
                     price * 100.0
@@ -66,7 +73,7 @@ pub async fn stream_prices(
 
                 if let Ok(mut c) = cache.write() {
                     c.insert(
-                        bba.asset_id.clone(),
+                        asset_id_str,
                         TokenPrice {
                             best_bid,
                             best_ask,

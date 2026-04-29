@@ -29,6 +29,9 @@ pub struct OpenPosition {
     pub tp_price: f64,
     pub sl_price: f64,
     pub entry_time_utc: String,
+    /// Order ID du GTC limit sell placé en TP (None en dry-run ou si placement échoué).
+    #[serde(default)]
+    pub tp_order_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -112,6 +115,14 @@ impl PositionManager {
     /// Retourne toutes les positions ouvertes.
     pub fn all_positions(&self) -> &[OpenPosition] {
         &self.positions
+    }
+
+    /// Met à jour le tp_order_id d'une position existante et persiste.
+    pub fn set_tp_order_id(&mut self, trade_id: &str, order_id: String) {
+        if let Some(pos) = self.positions.iter_mut().find(|p| p.trade_id == trade_id) {
+            pos.tp_order_id = Some(order_id);
+            self.save();
+        }
     }
 
     /// Supprime toutes les positions d'un slug (ex: marché expiré sans exit).
